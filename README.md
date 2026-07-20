@@ -10,6 +10,8 @@ text-to-speech model — Khmer-specialized fine-tune of VoxCPM2 (2B params,
 - **Voice design** — build a voice from a natural-language description, no reference audio
 - **Clone** — basic and "ultimate" (audio + transcript) voice cloning
 - **Live Python panel** — every control mirrored as a ready-to-run `voxcpm` snippet
+- **History** — the last 10 generations (metadata only), with replay, "reuse settings" to
+  restore every control from a past run, and delete
 - FastAPI backend with health checks, request validation, and GPU concurrency guard
 
 ## Quick start (Docker, recommended)

@@ -43,6 +43,38 @@ const DESIGN_CHIPS = {
 const GEN_STEPS = ["Normalizing text", "TSLM context pass", "LocDiT diffusion sampling", "AudioVAE 48kHz decode"];
 
 const API_KEY_STORAGE_KEY = "voxcpm_api_key";
+const HISTORY_STORAGE_KEY = "voxcpm_history";
+const MAX_HISTORY = 10;
+const MODE_LABELS = { speak: "Speak", design: "Design", clone: "Clone", ultimate: "Ultimate" };
+
+function truncate(s, n) {
+  const t = (s || "").trim();
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Audio blobs never survive a reload — only metadata is persisted.
+    return parsed.map((e) => ({ ...e, audioUrl: null }));
+  } catch {
+    return [];
+  }
+}
+
+function persistHistory(list) {
+  try {
+    localStorage.setItem(
+      HISTORY_STORAGE_KEY,
+      JSON.stringify(list.map(({ audioUrl, ...meta }) => meta))
+    );
+  } catch {
+    /* storage full or unavailable — history just won't survive reload */
+  }
+}
 
 /* ---------- tiny UI atoms ---------- */
 
@@ -193,6 +225,46 @@ function pcm16ToWavBlob(pcmBytes, sampleRate) {
   return new Blob([header, pcmBytes], { type: "audio/wav" });
 }
 
+/* ---------- generation history ---------- */
+
+function HistoryPanel({ history, onReplay, onReuse, onDelete }) {
+  const [open, setOpen] = useState(true);
+  if (!history.length) return null;
+  return (
+    <div className="card">
+      <button className="disclosure history-toggle" onClick={() => setOpen((v) => !v)}>
+        {open ? "▾" : "▸"} History <span className="opt">{history.length}</span>
+      </button>
+      {open && (
+        <ul className="history-list">
+          {history.map((e) => (
+            <li key={e.id} className="history-item">
+              <div className="history-main">
+                <span className="history-badge">{MODE_LABELS[e.mode] || e.mode}</span>
+                <span className="history-text kh">{truncate(e.text, 64) || "(empty text)"}</span>
+              </div>
+              <div className="history-meta mono">
+                cfg {e.cfg} · steps {e.steps} · {new Date(e.timestamp).toLocaleTimeString()}
+                {!e.audioUrl && <span className="history-note"> · audio not saved across reload</span>}
+              </div>
+              <div className="history-actions">
+                <button className="history-btn" onClick={() => onReplay(e)} disabled={!e.audioUrl}
+                  title={e.audioUrl ? "Replay this generation" : "Audio only lives in memory for this session — regenerate to hear it again"}>
+                  ▶ Replay
+                </button>
+                <button className="history-btn" onClick={() => onReuse(e)} title="Restore every control to this run's settings">
+                  ↺ Reuse settings
+                </button>
+                <button className="history-btn danger" onClick={() => onDelete(e.id)} aria-label="Remove from history">✕</button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /* ---------- python snippet builder ---------- */
 
 function buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }) {
@@ -256,6 +328,7 @@ export default function VoxCPMKhmerStudio() {
   const [liveLevels, setLiveLevels] = useState([]);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE_KEY) || "");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [history, setHistory] = useState(loadHistory);
   const audioRef = useRef(null);
   const timers = useRef([]);
   const audioCtxRef = useRef(null);
@@ -305,6 +378,51 @@ export default function VoxCPMKhmerStudio() {
   };
 
   const removeRef = () => { setRefInfo(null); setRefUploadError(null); };
+
+  const addHistoryEntry = (url) => {
+    const entry = {
+      id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      timestamp: Date.now(),
+      mode, text, designSel, cfg, steps, normalize, denoise, retry,
+      promptText: mode === "ultimate" ? promptText : "",
+      streamMode: streamMode && streamSupported,
+      audioUrl: url,
+    };
+    setHistory((h) => {
+      const next = [entry, ...h].slice(0, MAX_HISTORY);
+      persistHistory(next);
+      return next;
+    });
+  };
+
+  const deleteHistoryEntry = (id) => {
+    setHistory((h) => {
+      const next = h.filter((e) => e.id !== id);
+      persistHistory(next);
+      return next;
+    });
+  };
+
+  const replayHistoryEntry = (entry) => {
+    if (!entry.audioUrl) return;
+    setAudioUrl(entry.audioUrl);
+    setPlaying(false);
+    setGenState({ status: "done", step: GEN_STEPS.length, error: null, position: null });
+  };
+
+  const reuseHistoryEntry = (entry) => {
+    setTab(entry.mode === "design" ? "design" : entry.mode === "speak" ? "speak" : "clone");
+    setText(entry.text);
+    setCfg(entry.cfg);
+    setSteps(entry.steps);
+    setNormalize(entry.normalize);
+    setDenoise(entry.denoise);
+    setRetry(entry.retry);
+    setUltimate(entry.mode === "ultimate");
+    if (entry.mode === "design" && entry.designSel) setDesignSel(entry.designSel);
+    if (entry.mode === "ultimate") setPromptText(entry.promptText || "");
+    setStreamMode(Boolean(entry.streamMode));
+  };
 
   const designPrefix = useMemo(
     () => Object.values(designSel).filter(Boolean).join(", "),
@@ -367,8 +485,10 @@ export default function VoxCPMKhmerStudio() {
         });
         if (!res.ok) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
         const blob = await res.blob();
-        setAudioUrl(URL.createObjectURL(blob));
+        const objUrl = URL.createObjectURL(blob);
+        setAudioUrl(objUrl);
         setGenState({ status: "done", step: GEN_STEPS.length, error: null, position: null });
+        addHistoryEntry(objUrl);
         return;
       }
 
@@ -392,8 +512,10 @@ export default function VoxCPMKhmerStudio() {
           const resultRes = await fetch(`/api/jobs/${job_id}/result`, { headers: authHeaders() });
           if (!resultRes.ok) throw new Error(await errorDetail(resultRes, `Couldn't fetch the result (${resultRes.status})`));
           const blob = await resultRes.blob();
-          setAudioUrl(URL.createObjectURL(blob));
+          const objUrl = URL.createObjectURL(blob);
+          setAudioUrl(objUrl);
           setGenState({ status: "done", step: GEN_STEPS.length, error: null, position: null });
+          addHistoryEntry(objUrl);
           return;
         } else {
           throw new Error(s.error || "Synthesis failed.");
@@ -471,8 +593,10 @@ export default function VoxCPMKhmerStudio() {
       const merged = new Uint8Array(total);
       let offset = 0;
       for (const p of pcmParts) { merged.set(p, offset); offset += p.length; }
-      setAudioUrl(URL.createObjectURL(pcm16ToWavBlob(merged, sampleRate)));
+      const objUrl = URL.createObjectURL(pcm16ToWavBlob(merged, sampleRate));
+      setAudioUrl(objUrl);
       setGenState({ status: "done", step: GEN_STEPS.length, error: null });
+      addHistoryEntry(objUrl);
     } catch (e) {
       setGenState({ status: "error", step: 0, error: `Streaming failed: ${e.message}. Turn off Stream and try again for standard playback.` });
       setStreamMode(false);
@@ -695,6 +819,8 @@ export default function VoxCPMKhmerStudio() {
                 </div>
               )}
             </div>
+
+            <HistoryPanel history={history} onReplay={replayHistoryEntry} onReuse={reuseHistoryEntry} onDelete={deleteHistoryEntry} />
 
             <div className="card code-card">
               <div className="code-head">
@@ -927,6 +1053,21 @@ input[type=range] { width: 100%; accent-color: ${T.gold}; height: 22px; cursor: 
 .play { width: 38px; height: 38px; border-radius: 50%; border: none; cursor: pointer; background: ${T.gold}; color: ${T.bgDeep}; font-size: 13px; flex: none; }
 .dl { margin-left: auto; color: ${T.jade}; text-decoration: none; }
 .dl:hover { text-decoration: underline; }
+
+.history-toggle { padding: 0 0 2px; font-size: 12.5px; }
+.history-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.history-item { padding: 10px 12px; background: ${T.bgDeep}; border: 1px solid ${T.line}; border-radius: 10px; }
+.history-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.history-badge { flex: none; padding: 2px 8px; border-radius: 99px; font-family: 'JetBrains Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; background: ${T.surfaceHi}; color: ${T.jade}; border: 1px solid ${T.line}; }
+.history-text { font-size: 13px; color: ${T.text}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-meta { font-size: 11px; color: ${T.mutedDeep}; margin-top: 4px; }
+.history-note { color: ${T.mutedDeep}; }
+.history-actions { display: flex; gap: 6px; margin-top: 8px; }
+.history-btn { appearance: none; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${T.muted}; background: ${T.surfaceHi}; border: 1px solid ${T.line}; border-radius: 7px; padding: 5px 10px; }
+.history-btn:hover:not(:disabled) { color: ${T.text}; border-color: ${T.mutedDeep}; }
+.history-btn:disabled { opacity: .4; cursor: not-allowed; }
+.history-btn.danger { margin-left: auto; }
+.history-btn.danger:hover { color: #E06C5C; border-color: rgba(224,108,92,0.4); }
 
 .code-card { position: sticky; top: 16px; }
 .code-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }

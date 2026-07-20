@@ -73,11 +73,20 @@ OpenBMB's VoxCPM2.
   job queue forever. Both are now (re)created inside `lifespan()`/`bind_model_lock()`
   on every startup. Frontend: Playwright smoke test (`frontend/tests/smoke.spec.js`)
   mocks the API via route interception — app load, tab switching, generate → player,
-  and snippet-follows-slider. `make test-backend` / `make test-frontend` / `make
-  test` (root `Makefile`) run both; `.github/workflows/ci.yml` runs them on every
-  push/PR.
+  snippet-follows-slider, and the history replay/reuse-settings flow. `make
+  test-backend` / `make test-frontend` / `make test` (root `Makefile`) run both;
+  `.github/workflows/ci.yml` runs them on every push/PR.
+- History panel (frontend only, `App.jsx`): last 10 generations kept in a `history`
+  state array, persisted as metadata (text, mode, params, timestamp) to
+  `localStorage` — audio blobs are never persisted, only held in memory for the
+  session, so replay on an entry loaded from a previous session is disabled with an
+  explanatory note. Collapsible card under the player; each entry has a mode badge,
+  truncated text, cfg/steps summary, Replay, "Reuse settings" (restores tab, text,
+  every slider/toggle, and design/clone-specific fields from that run), and delete.
 
 ## Roadmap (good next tasks)
-1. History panel: keep the last N generations client-side with replay.
-2. Redis-backed queue and rate limiter for multi-process/multi-replica
+1. Redis-backed queue and rate limiter for multi-process/multi-replica
    deployments (both are in-process/single-worker today).
+2. SSML-style inline controls (pauses, emphasis) for finer-grained speech direction.
+3. Batch synthesis: submit a list of texts as one job, download a zip of results.
+4. User accounts: persist history and API keys server-side instead of per-browser.

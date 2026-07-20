@@ -83,6 +83,35 @@ test("typing text and clicking Generate produces a player", async ({ page }) => 
   await expect(page.getByText("output.wav · 48 kHz")).toBeVisible();
 });
 
+test("history records generations and reuse-settings restores controls", async ({ page }) => {
+  await mockBackend(page);
+  await page.goto("/");
+  const cfgSlider = page.locator('input[type="range"]').first();
+  const textarea = page.locator("textarea.kh");
+
+  await textarea.fill("First run text");
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(page.getByText("output.wav · 48 kHz")).toBeVisible({ timeout: 10_000 });
+
+  await cfgSlider.fill("3.5");
+  await cfgSlider.dispatchEvent("input");
+  await textarea.fill("Second run text");
+  await page.getByRole("button", { name: "Generate speech" }).click();
+  await expect(page.getByText("output.wav · 48 kHz")).toBeVisible({ timeout: 10_000 });
+
+  const items = page.locator(".history-item");
+  await expect(items).toHaveCount(2);
+  await expect(items.first()).toContainText("Second run text");
+  await expect(items.last()).toContainText("First run text");
+
+  await items.last().getByRole("button", { name: /Replay/ }).click();
+  await expect(page.getByText("output.wav · 48 kHz")).toBeVisible();
+
+  await items.last().getByRole("button", { name: /Reuse settings/ }).click();
+  await expect(textarea).toHaveValue("First run text");
+  await expect(cfgSlider).toHaveValue("2");
+});
+
 test("moving a slider updates the Python snippet", async ({ page }) => {
   await mockBackend(page);
   await page.goto("/");
