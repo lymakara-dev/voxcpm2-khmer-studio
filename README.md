@@ -68,6 +68,16 @@ deletes it after `UPLOAD_TTL_HOURS` (default 24h).
 ```
 Use `ref_id` as `reference_ref_id` / `prompt_ref_id` in a subsequent `/api/tts` call.
 
+### `POST /api/tts-stream` → chunked `audio/pcm;rate=48000`
+Same request body as `/api/tts`. Instead of a WAV file, the response is chunked raw
+**16-bit little-endian PCM, mono**, at the rate given in the `X-Sample-Rate` header —
+a WAV container needs the total byte length up front, which isn't available while
+streaming. The frontend decodes each chunk into a Web Audio `AudioBuffer` and schedules
+it for playback as it arrives, so audio starts before generation finishes; once the
+stream ends, the accumulated PCM is wrapped into a WAV blob client-side so downloading
+still works. Returns 429 (same `detail` shape as `/api/tts`) if a synthesis is already
+in progress.
+
 ### `GET /api/health` · `GET /api/model-info`
 `model-info` includes `allow_raw_paths` and `mock` so the frontend can adapt its UI
 (e.g. only showing the raw server-path field when raw paths are actually accepted).

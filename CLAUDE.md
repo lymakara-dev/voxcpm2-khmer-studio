@@ -36,10 +36,16 @@ OpenBMB's VoxCPM2.
   upload zone; the raw-path field only shows if `/api/model-info` reports
   `allow_raw_paths: true`. `MOCK_TTS=1` skips real model loading and returns a
   synthetic sine-wave clip — used for GPU-less dev and all tests.
+- Streaming synthesis (`POST /api/tts-stream`): chunked raw 16-bit PCM, bridging
+  the model's blocking `generate_streaming` sync generator to an async response
+  via a thread + queue (`tts_model.stream_pcm16`). Frontend "Stream" toggle
+  (only enabled for the default `/api/tts` endpoint) plays chunks through Web
+  Audio as they arrive and rebuilds a WAV blob client-side at the end so
+  download/replay still work; falls back to a clear error and switches Stream
+  off if the browser or endpoint doesn't support it.
 
 ## Roadmap (good next tasks)
-1. Streaming synthesis via `model.generate_streaming` + chunked audio playback.
-2. Job queue (e.g. simple asyncio queue or Redis) instead of 429-on-busy.
-3. Rate limiting + API key auth for public deployments.
-4. Playwright smoke test + pytest for the API.
-5. History panel: keep the last N generations client-side with replay.
+1. Job queue (e.g. simple asyncio queue or Redis) instead of 429-on-busy.
+2. Rate limiting + API key auth for public deployments.
+3. Playwright smoke test + pytest for the API.
+4. History panel: keep the last N generations client-side with replay.

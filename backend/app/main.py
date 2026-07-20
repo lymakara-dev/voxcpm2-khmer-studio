@@ -1,6 +1,7 @@
 """VoxCPM2-Khmer inference server.
 
 POST /api/tts          -> synthesize speech, returns audio/wav
+POST /api/tts-stream   -> synthesize speech, chunked raw 16-bit PCM
 POST /api/upload-ref   -> upload reference audio, returns a ref_id
 GET  /api/health       -> liveness + model status
 GET  /api/model-info   -> static model metadata
@@ -26,10 +27,11 @@ from contextlib import asynccontextmanager
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from . import config, errors, uploads
-from .tts_model import get_model, is_loaded
+from .tts_model import get_model, is_loaded, stream_pcm16
 
 logger = logging.getLogger("voxcpm-server")
 logging.basicConfig(level=logging.INFO)
@@ -112,6 +114,24 @@ async def upload_ref(file: UploadFile):
     return await uploads.save_upload(file)
 
 
+def _generate_kwargs(req: TTSRequest) -> dict:
+    return dict(
+        text=req.text,
+        cfg_value=req.cfg_value,
+        inference_timesteps=req.inference_timesteps,
+        normalize=req.normalize,
+        denoise=req.denoise,
+        retry_badcase=req.retry_badcase,
+        reference_wav_path=req.reference_wav_path,
+        prompt_wav_path=req.prompt_wav_path,
+        prompt_text=req.prompt_text,
+    )
+
+
+def _sample_rate(model) -> int:
+    return getattr(getattr(model, "tts_model", None), "sample_rate", 48000)
+
+
 @app.post("/api/tts")
 async def tts(req: TTSRequest):
     model = await get_model()
@@ -122,28 +142,43 @@ async def tts(req: TTSRequest):
     async with _model_lock:
         t0 = time.time()
         try:
-            wav = await asyncio.to_thread(
-                model.generate,
-                text=req.text,
-                cfg_value=req.cfg_value,
-                inference_timesteps=req.inference_timesteps,
-                normalize=req.normalize,
-                denoise=req.denoise,
-                retry_badcase=req.retry_badcase,
-                reference_wav_path=req.reference_wav_path,
-                prompt_wav_path=req.prompt_wav_path,
-                prompt_text=req.prompt_text,
-            )
+            wav = await asyncio.to_thread(model.generate, **_generate_kwargs(req))
         except Exception as exc:  # surface a clean error, log the full trace
             logger.exception("Synthesis failed")
             raise HTTPException(status_code=500, detail=f"Synthesis failed: {exc}") from exc
 
-    sample_rate = getattr(getattr(model, "tts_model", None), "sample_rate", 48000)
+    sample_rate = _sample_rate(model)
     buf = io.BytesIO()
     sf.write(buf, wav, sample_rate, format="WAV")
     logger.info("Synthesized %d chars in %.1fs", len(req.text), time.time() - t0)
     return Response(
         content=buf.getvalue(),
         media_type="audio/wav",
+        headers={"X-Sample-Rate": str(sample_rate)},
+    )
+
+
+@app.post("/api/tts-stream")
+async def tts_stream(req: TTSRequest):
+    """Chunked raw 16-bit little-endian PCM, mono, at the rate in
+    X-Sample-Rate. Not a WAV container — a WAV header needs the total
+    length up front, which streaming can't provide."""
+    model = await get_model()
+
+    if _model_lock.locked():
+        raise HTTPException(status_code=429, detail="Synthesis in progress, retry shortly")
+
+    sample_rate = _sample_rate(model)
+
+    async def body():
+        t0 = time.time()
+        async with _model_lock:
+            async for chunk in stream_pcm16(model, **_generate_kwargs(req)):
+                yield chunk
+        logger.info("Streamed %d chars in %.1fs", len(req.text), time.time() - t0)
+
+    return StreamingResponse(
+        body(),
+        media_type=f"audio/pcm;rate={sample_rate}",
         headers={"X-Sample-Rate": str(sample_rate)},
     )

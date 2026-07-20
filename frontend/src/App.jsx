@@ -72,9 +72,11 @@ function Toggle({ label, on, onChange, hint }) {
 
 /* ---------- waveform signature ---------- */
 
-function Waveform({ playing, seed }) {
+function Waveform({ playing, seed, live, liveLevels }) {
   const ref = useRef(null);
   const raf = useRef(null);
+  const levelsRef = useRef([]);
+  useEffect(() => { levelsRef.current = liveLevels || []; }, [liveLevels]);
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
@@ -88,26 +90,33 @@ function Waveform({ playing, seed }) {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
       const bars = Math.floor(w / 7);
+      const levels = levelsRef.current;
       for (let i = 0; i < bars; i++) {
         const x = i * 7 + 3;
-        const ph = Math.sin(i * 0.55 + seed) * 0.5 + 0.5;
-        const anim = playing ? (Math.sin(t * 0.11 + i * 0.5) * 0.5 + 0.5) : 0.18 + ph * 0.12;
-        const amp = playing ? (0.15 + 0.85 * ph * anim) : anim;
+        let amp, color;
+        if (live && levels.length) {
+          const lv = levels[(i + Math.floor(t / 3)) % levels.length] || 0;
+          amp = 0.08 + lv * 0.92;
+          color = i % 9 === 0 ? T.gold : T.jade;
+        } else {
+          const ph = Math.sin(i * 0.55 + seed) * 0.5 + 0.5;
+          const anim = playing ? (Math.sin(t * 0.11 + i * 0.5) * 0.5 + 0.5) : 0.18 + ph * 0.12;
+          amp = playing ? (0.15 + 0.85 * ph * anim) : anim;
+          color = playing ? (i % 9 === 0 ? T.jade : T.gold) : "rgba(227,168,59,0.28)";
+        }
         const bh = Math.max(2, amp * h * 0.9);
-        ctx.fillStyle = playing
-          ? (i % 9 === 0 ? T.jade : T.gold)
-          : "rgba(227,168,59,0.28)";
+        ctx.fillStyle = color;
         ctx.beginPath();
         ctx.roundRect(x, (h - bh) / 2, 3.4, bh, 2);
         ctx.fill();
       }
       t += 1;
-      if (playing && !reduced) raf.current = requestAnimationFrame(draw);
+      if ((playing || live) && !reduced) raf.current = requestAnimationFrame(draw);
     };
     draw();
-    if (playing && !reduced) raf.current = requestAnimationFrame(draw);
+    if ((playing || live) && !reduced) raf.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf.current);
-  }, [playing, seed]);
+  }, [playing, seed, live]);
   return <canvas ref={ref} className="wave" aria-hidden="true" />;
 }
 
@@ -168,6 +177,20 @@ function UploadZone({ refInfo, uploading, progress, error, onFile, onRemove }) {
   );
 }
 
+/* ---------- pcm16 -> wav (client-side, for streamed playback download) ---------- */
+
+function pcm16ToWavBlob(pcmBytes, sampleRate) {
+  const header = new ArrayBuffer(44);
+  const v = new DataView(header);
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF"); v.setUint32(4, 36 + pcmBytes.length, true); writeStr(8, "WAVE");
+  writeStr(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  writeStr(36, "data"); v.setUint32(40, pcmBytes.length, true);
+  return new Blob([header, pcmBytes], { type: "audio/wav" });
+}
+
 /* ---------- python snippet builder ---------- */
 
 function buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }) {
@@ -226,8 +249,13 @@ export default function VoxCPMKhmerStudio() {
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
   const [seed, setSeed] = useState(1);
+  const [streamMode, setStreamMode] = useState(false);
+  const [liveStreaming, setLiveStreaming] = useState(false);
+  const [liveLevels, setLiveLevels] = useState([]);
   const audioRef = useRef(null);
   const timers = useRef([]);
+  const audioCtxRef = useRef(null);
+  const nextStartTimeRef = useRef(0);
 
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
@@ -271,6 +299,7 @@ export default function VoxCPMKhmerStudio() {
   const needsRef = mode === "clone" || mode === "ultimate";
   const hasRef = Boolean(refInfo) || (showAdvancedPath && refPath.trim());
   const snippetRefPath = refPath || refInfo?.filename || "";
+  const streamSupported = /\/api\/tts$/.test(endpoint.trim());
 
   const snippet = useMemo(
     () => buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath: snippetRefPath, promptText }),
@@ -286,40 +315,125 @@ export default function VoxCPMKhmerStudio() {
     setCopied(true); setTimeout(() => setCopied(false), 1600);
   };
 
+  const buildRequestBody = () => {
+    const isCloneMode = mode === "clone" || mode === "ultimate";
+    const usingRawPath = isCloneMode && showAdvancedPath && refPath.trim();
+    return {
+      text: mode === "design" && designPrefix ? `(${designPrefix})${text}` : text,
+      cfg_value: cfg, inference_timesteps: steps,
+      normalize, denoise, retry_badcase: retry,
+      reference_wav_path: usingRawPath ? refPath.trim() : null,
+      prompt_wav_path: mode === "ultimate" && usingRawPath ? refPath.trim() : null,
+      reference_ref_id: isCloneMode && !usingRawPath ? refInfo?.ref_id || null : null,
+      prompt_ref_id: mode === "ultimate" && !usingRawPath ? refInfo?.ref_id || null : null,
+      prompt_text: mode === "ultimate" ? promptText || null : null,
+    };
+  };
+
+  const errorDetail = async (res, fallback) => {
+    if (res.status === 429) return "Server busy — another synthesis is running, try again shortly";
+    try { return (await res.json()).detail || fallback; } catch { return fallback; }
+  };
+
+  const generateBuffered = async () => {
+    setGenState({ status: "running", step: 1, error: null });
+    try {
+      const res = await fetch(endpoint.trim(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildRequestBody()),
+      });
+      if (!res.ok) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
+      const blob = await res.blob();
+      setAudioUrl(URL.createObjectURL(blob));
+      setGenState({ status: "done", step: GEN_STEPS.length, error: null });
+    } catch (e) {
+      const msg = e instanceof TypeError
+        ? `Couldn't reach the endpoint (${e.message}). Check the URL and that the server allows CORS from this origin.`
+        : e.message;
+      setGenState({ status: "error", step: 0, error: msg });
+    }
+  };
+
+  const generateStreaming = async () => {
+    setGenState({ status: "running", step: 1, error: null });
+    setLiveStreaming(true);
+    setLiveLevels([]);
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); }
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      setLiveStreaming(false);
+      setGenState({ status: "error", step: 0, error: "This browser doesn't support the Web Audio API needed for streaming — turn off Stream and try again." });
+      return;
+    }
+    const ctx = new AudioCtx();
+    audioCtxRef.current = ctx;
+    nextStartTimeRef.current = ctx.currentTime + 0.1;
+    const streamUrl = endpoint.trim().replace(/\/tts$/, "/tts-stream");
+    const pcmParts = [];
+    let leftover = new Uint8Array(0);
+    try {
+      const res = await fetch(streamUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildRequestBody()),
+      });
+      if (!res.ok || !res.body) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
+      const sampleRate = parseInt(res.headers.get("X-Sample-Rate"), 10) || 48000;
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pcmParts.push(value);
+        let bytes = value;
+        if (leftover.length) {
+          const merged = new Uint8Array(leftover.length + bytes.length);
+          merged.set(leftover, 0); merged.set(bytes, leftover.length);
+          bytes = merged;
+        }
+        if (bytes.length % 2 !== 0) {
+          leftover = bytes.slice(bytes.length - 1);
+          bytes = bytes.slice(0, bytes.length - 1);
+        } else {
+          leftover = new Uint8Array(0);
+        }
+        const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2);
+        const floatData = new Float32Array(samples.length);
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) {
+          floatData[i] = samples[i] / 32768;
+          peak = Math.max(peak, Math.abs(floatData[i]));
+        }
+        const buffer = ctx.createBuffer(1, floatData.length, sampleRate);
+        buffer.copyToChannel(floatData, 0);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const startAt = Math.max(nextStartTimeRef.current, ctx.currentTime);
+        src.start(startAt);
+        nextStartTimeRef.current = startAt + buffer.duration;
+        setLiveLevels((levels) => [...levels.slice(-39), peak]);
+      }
+      const total = pcmParts.reduce((n, p) => n + p.length, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const p of pcmParts) { merged.set(p, offset); offset += p.length; }
+      setAudioUrl(URL.createObjectURL(pcm16ToWavBlob(merged, sampleRate)));
+      setGenState({ status: "done", step: GEN_STEPS.length, error: null });
+    } catch (e) {
+      setGenState({ status: "error", step: 0, error: `Streaming failed: ${e.message}. Turn off Stream and try again for standard playback.` });
+      setStreamMode(false);
+    } finally {
+      setLiveStreaming(false);
+    }
+  };
+
   const generate = async () => {
     setAudioUrl(null); setPlaying(false); setSeed(Math.random() * 10);
     timers.current.forEach(clearTimeout); timers.current = [];
     if (endpoint.trim()) {
-      setGenState({ status: "running", step: 1, error: null });
-      const isCloneMode = mode === "clone" || mode === "ultimate";
-      const usingRawPath = isCloneMode && showAdvancedPath && refPath.trim();
-      try {
-        const res = await fetch(endpoint.trim(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: mode === "design" && designPrefix ? `(${designPrefix})${text}` : text,
-            cfg_value: cfg, inference_timesteps: steps,
-            normalize, denoise, retry_badcase: retry,
-            reference_wav_path: usingRawPath ? refPath.trim() : null,
-            prompt_wav_path: mode === "ultimate" && usingRawPath ? refPath.trim() : null,
-            reference_ref_id: isCloneMode && !usingRawPath ? refInfo?.ref_id || null : null,
-            prompt_ref_id: mode === "ultimate" && !usingRawPath ? refInfo?.ref_id || null : null,
-            prompt_text: mode === "ultimate" ? promptText || null : null,
-          }),
-        });
-        if (res.status === 429) throw new Error("Server busy — another synthesis is running, try again shortly");
-        if (!res.ok) {
-          let detail = `Server replied ${res.status}`;
-          try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
-          throw new Error(detail);
-        }
-        const blob = await res.blob();
-        setAudioUrl(URL.createObjectURL(blob));
-        setGenState({ status: "done", step: GEN_STEPS.length, error: null });
-      } catch (e) {
-        setGenState({ status: "error", step: 0, error: e.message });
-      }
+      if (streamMode && streamSupported) await generateStreaming();
+      else await generateBuffered();
       return;
     }
     // Demo mode: walk through the real pipeline stages, no audio produced
@@ -358,7 +472,7 @@ export default function VoxCPMKhmerStudio() {
         </div>
       </header>
 
-      <Waveform playing={genState.status === "running" || playing} seed={seed} />
+      <Waveform playing={genState.status === "running" || playing} seed={seed} live={liveStreaming} liveLevels={liveLevels} />
 
       {/* ---------- tabs ---------- */}
       <nav className="tabs" role="tablist">
@@ -461,14 +575,21 @@ export default function VoxCPMKhmerStudio() {
           {/* ---------- right column: output ---------- */}
           <section className="col">
             <div className="card">
-              <h2>Generate</h2>
+              <div className="card-head-row">
+                <h2>Generate</h2>
+                <button className={"stream-toggle" + (streamMode ? " on" : "")}
+                  onClick={() => setStreamMode((v) => !v)} disabled={!streamSupported}
+                  title={streamSupported ? "Play audio as it's generated" : "Only available for the default /api/tts endpoint"}>
+                  {streamMode ? "◉" : "○"} Stream
+                </button>
+              </div>
               <label className="field-label" htmlFor="ep">Inference endpoint <span className="opt">optional</span></label>
               <input id="ep" className="field mono" placeholder="https://your-server/tts  (POST, returns audio)"
                 value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
               <p className="hint">Leave empty to preview the pipeline in demo mode. The model itself runs on a GPU server (~8 GB VRAM) — point this at your VoxCPM endpoint to get real audio back.</p>
               <button className="cta" onClick={generate}
                 disabled={genState.status === "running" || !text.trim() || (needsRef && !hasRef)}>
-                {genState.status === "running" ? "Synthesizing…" : "Generate speech"}
+                {genState.status === "running" ? (streamMode && streamSupported ? "Streaming…" : "Synthesizing…") : "Generate speech"}
               </button>
               {needsRef && !hasRef && <p className="hint">Upload a reference clip (or set a server path) to generate.</p>}
 
@@ -484,7 +605,7 @@ export default function VoxCPMKhmerStudio() {
                 <div className="note">Demo run complete — no endpoint set, so no audio was produced. Copy the Python below to run the real thing, or connect an endpoint above.</div>
               )}
               {genState.status === "error" && (
-                <div className="note err">Endpoint request failed: {genState.error}. Check the URL, CORS headers, and that the server returns an audio blob.</div>
+                <div className="note err">{genState.error}</div>
               )}
               {audioUrl && (
                 <div className="player">
@@ -631,6 +752,12 @@ h1 { font-family: 'Space Grotesk', sans-serif; font-size: clamp(22px, 3.4vw, 30p
 
 .card { background: ${T.surface}; border: 1px solid ${T.line}; border-radius: 14px; padding: 18px 18px 16px; }
 .card h2 { font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: ${T.text}; margin: 0 0 12px; }
+.card-head-row { display: flex; justify-content: space-between; align-items: center; }
+.card-head-row h2 { margin: 0 0 12px; }
+.stream-toggle { appearance: none; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${T.muted}; background: ${T.surfaceHi}; border: 1px solid ${T.line}; border-radius: 99px; padding: 5px 11px; margin-bottom: 10px; }
+.stream-toggle:hover:not(:disabled) { color: ${T.text}; border-color: ${T.mutedDeep}; }
+.stream-toggle.on { color: ${T.bgDeep}; background: ${T.jade}; border-color: ${T.jade}; font-weight: 600; }
+.stream-toggle:disabled { opacity: .4; cursor: not-allowed; }
 .hint { font-size: 12px; color: ${T.muted}; line-height: 1.5; margin: 6px 0 0; }
 .body { font-size: 13.5px; line-height: 1.6; color: ${T.text}; margin: 0 0 10px; }
 
