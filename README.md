@@ -36,6 +36,22 @@ npm install
 npm run dev
 ```
 
+## Testing
+Everything runs without a GPU — the backend suite forces `MOCK_TTS=1` and the frontend
+suite mocks the API entirely via Playwright route interception.
+
+```bash
+make test-backend   # pytest — health/model-info, tts, upload, job queue, auth, rate limits
+make test-frontend   # vite build + Playwright smoke test
+make test           # both
+```
+
+`backend/requirements-dev.txt` deliberately skips `voxcpm` (and its torch dependency
+chain) from `requirements.txt` — the test suite runs under `MOCK_TTS=1`, where the real
+model is never imported, so installing it would only slow CI down for no benefit.
+
+CI (`.github/workflows/ci.yml`) runs both suites on every push and PR.
+
 ## API
 
 ### `POST /api/tts` → `audio/wav`

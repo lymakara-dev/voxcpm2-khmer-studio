@@ -47,6 +47,12 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _model_lock
+    # Created fresh per lifespan startup, not once at import time: asyncio
+    # primitives latch onto whichever loop first awaits them, and reusing
+    # one across independent lifespans (e.g. one per test with TestClient)
+    # raises "bound to a different event loop".
+    _model_lock = asyncio.Lock()
     if not config.LAZY_LOAD:
         await get_model()
     jobs.bind_model_lock(_model_lock)
@@ -68,7 +74,7 @@ app.add_middleware(
 )
 errors.install(app)
 
-_model_lock = asyncio.Lock()   # one synthesis at a time per GPU
+_model_lock: asyncio.Lock  # one synthesis at a time per GPU; (re)created in lifespan()
 
 
 class TTSRequest(BaseModel):

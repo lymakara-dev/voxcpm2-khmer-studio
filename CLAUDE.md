@@ -60,9 +60,24 @@ OpenBMB's VoxCPM2.
   would need to implement. Frontend has a gear-icon settings panel (API key
   in localStorage, attached to every request) and surfaces 401s as "Invalid
   or missing API key — add one in settings."
+- Tests (`backend/tests/`, `frontend/tests/`): pytest suite (health/model-info shape,
+  tts happy path + validation, upload flow + rejections, job queue lifecycle +
+  queue-full 429, auth on/off, rate-limit trips) runs entirely under `MOCK_TTS=1` —
+  `backend/requirements-dev.txt` intentionally skips `requirements.txt`'s `voxcpm`
+  (and its torch chain) since the real model is never imported in that mode. Fixed a
+  real bug surfaced by writing these tests: `jobs.py`'s `_wakeup` condition and
+  `main.py`'s `_model_lock` were module-level singletons created once at import —
+  asyncio.Condition/Lock latch onto whichever event loop first awaits them, so a
+  second app lifespan (each `TestClient` in a test spins up its own loop) raised
+  "bound to a different event loop" inside the worker task and silently wedged the
+  job queue forever. Both are now (re)created inside `lifespan()`/`bind_model_lock()`
+  on every startup. Frontend: Playwright smoke test (`frontend/tests/smoke.spec.js`)
+  mocks the API via route interception — app load, tab switching, generate → player,
+  and snippet-follows-slider. `make test-backend` / `make test-frontend` / `make
+  test` (root `Makefile`) run both; `.github/workflows/ci.yml` runs them on every
+  push/PR.
 
 ## Roadmap (good next tasks)
-1. Playwright smoke test + pytest for the API.
-2. History panel: keep the last N generations client-side with replay.
-3. Redis-backed queue and rate limiter for multi-process/multi-replica
+1. History panel: keep the last N generations client-side with replay.
+2. Redis-backed queue and rate limiter for multi-process/multi-replica
    deployments (both are in-process/single-worker today).

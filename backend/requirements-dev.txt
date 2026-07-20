@@ -1,0 +1,15 @@
+# Deliberately does NOT pull in requirements.txt's `voxcpm` (and its heavy
+# torch dependency chain): under MOCK_TTS=1 the whole test suite runs, the
+# real model is never imported (tts_model.get_model() only imports voxcpm
+# when MOCK_TTS is unset), so installing it here would only slow down CI
+# for no benefit. Everything else the app needs is listed explicitly.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+soundfile>=0.12
+pydantic>=2.7
+numpy>=1.26
+scipy>=1.13
+python-multipart>=0.0.9
+pytest>=8.0
+pytest-asyncio>=0.24
+httpx>=0.27
