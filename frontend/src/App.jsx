@@ -244,7 +244,7 @@ export default function VoxCPMKhmerStudio() {
   const [promptText, setPromptText] = useState("");
   const [ultimate, setUltimate] = useState(false);
   const [endpoint, setEndpoint] = useState("/api/tts");
-  const [genState, setGenState] = useState({ status: "idle", step: 0, error: null });
+  const [genState, setGenState] = useState({ status: "idle", step: 0, error: null, position: null });
   const [audioUrl, setAudioUrl] = useState(null);
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -331,27 +331,63 @@ export default function VoxCPMKhmerStudio() {
   };
 
   const errorDetail = async (res, fallback) => {
-    if (res.status === 429) return "Server busy — another synthesis is running, try again shortly";
     try { return (await res.json()).detail || fallback; } catch { return fallback; }
   };
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const POLL_INTERVAL_MS = 1500;
+
   const generateBuffered = async () => {
-    setGenState({ status: "running", step: 1, error: null });
+    const url = endpoint.trim();
+    const useQueue = streamSupported; // same /api/tts pattern — our own backend's job-queue endpoints
+    setGenState({ status: "running", step: useQueue ? 0 : 1, error: null, position: null });
     try {
-      const res = await fetch(endpoint.trim(), {
+      if (!useQueue) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildRequestBody()),
+        });
+        if (!res.ok) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
+        const blob = await res.blob();
+        setAudioUrl(URL.createObjectURL(blob));
+        setGenState({ status: "done", step: GEN_STEPS.length, error: null, position: null });
+        return;
+      }
+
+      const submitRes = await fetch(`${url}?async=1`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(buildRequestBody()),
       });
-      if (!res.ok) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
-      const blob = await res.blob();
-      setAudioUrl(URL.createObjectURL(blob));
-      setGenState({ status: "done", step: GEN_STEPS.length, error: null });
+      if (!submitRes.ok) throw new Error(await errorDetail(submitRes, `Server replied ${submitRes.status}`));
+      const { job_id } = await submitRes.json();
+
+      for (;;) {
+        const statusRes = await fetch(`/api/jobs/${job_id}`);
+        if (!statusRes.ok) throw new Error(await errorDetail(statusRes, `Job status check failed (${statusRes.status})`));
+        const s = await statusRes.json();
+        if (s.status === "queued") {
+          setGenState({ status: "queued", step: 0, error: null, position: s.position });
+        } else if (s.status === "running") {
+          setGenState({ status: "running", step: 1, error: null, position: null });
+        } else if (s.status === "done") {
+          const resultRes = await fetch(`/api/jobs/${job_id}/result`);
+          if (!resultRes.ok) throw new Error(await errorDetail(resultRes, `Couldn't fetch the result (${resultRes.status})`));
+          const blob = await resultRes.blob();
+          setAudioUrl(URL.createObjectURL(blob));
+          setGenState({ status: "done", step: GEN_STEPS.length, error: null, position: null });
+          return;
+        } else {
+          throw new Error(s.error || "Synthesis failed.");
+        }
+        await sleep(POLL_INTERVAL_MS);
+      }
     } catch (e) {
       const msg = e instanceof TypeError
         ? `Couldn't reach the endpoint (${e.message}). Check the URL and that the server allows CORS from this origin.`
         : e.message;
-      setGenState({ status: "error", step: 0, error: msg });
+      setGenState({ status: "error", step: 0, error: msg, position: null });
     }
   };
 
@@ -588,10 +624,16 @@ export default function VoxCPMKhmerStudio() {
                 value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
               <p className="hint">Leave empty to preview the pipeline in demo mode. The model itself runs on a GPU server (~8 GB VRAM) — point this at your VoxCPM endpoint to get real audio back.</p>
               <button className="cta" onClick={generate}
-                disabled={genState.status === "running" || !text.trim() || (needsRef && !hasRef)}>
-                {genState.status === "running" ? (streamMode && streamSupported ? "Streaming…" : "Synthesizing…") : "Generate speech"}
+                disabled={genState.status === "running" || genState.status === "queued" || !text.trim() || (needsRef && !hasRef)}>
+                {genState.status === "queued" ? `Queued — position ${genState.position}…`
+                  : genState.status === "running" ? (streamMode && streamSupported ? "Streaming…" : "Synthesizing…")
+                  : "Generate speech"}
               </button>
               {needsRef && !hasRef && <p className="hint">Upload a reference clip (or set a server path) to generate.</p>}
+
+              {genState.status === "queued" && (
+                <div className="note">In queue — position {genState.position}. This updates automatically every {POLL_INTERVAL_MS / 1000}s.</div>
+              )}
 
               <ol className="pipeline">
                 {GEN_STEPS.map((s, i) => (

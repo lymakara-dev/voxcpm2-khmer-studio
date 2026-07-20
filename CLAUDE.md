@@ -43,9 +43,17 @@ OpenBMB's VoxCPM2.
   Audio as they arrive and rebuilds a WAV blob client-side at the end so
   download/replay still work; falls back to a clear error and switches Stream
   off if the browser or endpoint doesn't support it.
+- Job queue (`app/jobs.py`): `/api/tts` is now a bounded FIFO queue (`MAX_QUEUE`)
+  with a single worker instead of lock-or-429; 429 only fires once the queue
+  itself is full. `?async=1` returns `{job_id, position}` immediately;
+  `GET /api/jobs/{id}` / `GET /api/jobs/{id}/result` poll status and fetch the
+  result (results expire after `JOB_TTL_MIN`). The worker shares `_model_lock`
+  with `/api/tts-stream` so the two paths never run generation concurrently.
+  Frontend polls every 1.5s and shows "In queue — position N" while queued.
 
 ## Roadmap (good next tasks)
-1. Job queue (e.g. simple asyncio queue or Redis) instead of 429-on-busy.
-2. Rate limiting + API key auth for public deployments.
-3. Playwright smoke test + pytest for the API.
-4. History panel: keep the last N generations client-side with replay.
+1. Rate limiting + API key auth for public deployments.
+2. Playwright smoke test + pytest for the API.
+3. History panel: keep the last N generations client-side with replay.
+4. Redis-backed queue for multi-process/multi-replica deployments (current
+   queue is in-process, single-worker only).

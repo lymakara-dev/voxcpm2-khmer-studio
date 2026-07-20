@@ -1,15 +1,19 @@
 """VoxCPM2-Khmer inference server.
 
-POST /api/tts          -> synthesize speech, returns audio/wav
-POST /api/tts-stream   -> synthesize speech, chunked raw 16-bit PCM
-POST /api/upload-ref   -> upload reference audio, returns a ref_id
-GET  /api/health       -> liveness + model status
-GET  /api/model-info   -> static model metadata
+POST /api/tts               -> synthesize speech, returns audio/wav (or a
+                                job_id immediately with ?async=1)
+POST /api/tts-stream        -> synthesize speech, chunked raw 16-bit PCM
+GET  /api/jobs/{id}         -> job status + queue position
+GET  /api/jobs/{id}/result  -> the finished job's audio/wav
+POST /api/upload-ref        -> upload reference audio, returns a ref_id
+GET  /api/health            -> liveness + model status
+GET  /api/model-info        -> static model metadata
 
-The 2B model is loaded once at startup (lazy on first request if
-LAZY_LOAD=1) and guarded by a lock: a single GPU can only run one
-synthesis at a time, concurrent requests get 429 so the client can
-retry instead of queueing unbounded work.
+/api/tts is backed by a bounded FIFO queue (MAX_QUEUE) with a single
+worker, so GPU access is serialized fairly instead of rejecting concurrent
+requests outright; 429 only happens once the queue itself is full.
+/api/tts-stream shares the same underlying lock so it never overlaps with
+queued work.
 
 Set MOCK_TTS=1 to skip loading the real model entirely and return a
 synthetic sine-wave clip instead — used for frontend dev without a GPU,
@@ -19,18 +23,16 @@ CI, and the test suite.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import time
 from contextlib import asynccontextmanager
 
-import soundfile as sf
-from fastapi import FastAPI, HTTPException, Response, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from . import config, errors, uploads
+from . import config, errors, jobs, uploads
 from .tts_model import get_model, is_loaded, stream_pcm16
 
 logger = logging.getLogger("voxcpm-server")
@@ -41,10 +43,13 @@ logging.basicConfig(level=logging.INFO)
 async def lifespan(_app: FastAPI):
     if not config.LAZY_LOAD:
         await get_model()
+    jobs.bind_model_lock(_model_lock)
+    worker_task = asyncio.create_task(jobs.worker_loop())
     cleanup_task = asyncio.create_task(uploads.cleanup_loop())
     try:
         yield
     finally:
+        worker_task.cancel()
         cleanup_task.cancel()
 
 
@@ -132,30 +137,42 @@ def _sample_rate(model) -> int:
     return getattr(getattr(model, "tts_model", None), "sample_rate", 48000)
 
 
-@app.post("/api/tts")
-async def tts(req: TTSRequest):
-    model = await get_model()
-
-    if _model_lock.locked():
-        raise HTTPException(status_code=429, detail="Synthesis in progress, retry shortly")
-
-    async with _model_lock:
-        t0 = time.time()
-        try:
-            wav = await asyncio.to_thread(model.generate, **_generate_kwargs(req))
-        except Exception as exc:  # surface a clean error, log the full trace
-            logger.exception("Synthesis failed")
-            raise HTTPException(status_code=500, detail=f"Synthesis failed: {exc}") from exc
-
-    sample_rate = _sample_rate(model)
-    buf = io.BytesIO()
-    sf.write(buf, wav, sample_rate, format="WAV")
-    logger.info("Synthesized %d chars in %.1fs", len(req.text), time.time() - t0)
+def _job_result_response(job: jobs.Job) -> Response:
+    if job.status == "failed":
+        raise HTTPException(status_code=500, detail=job.error)
+    if job.status == "expired" or job.wav_bytes is None:
+        raise HTTPException(status_code=410, detail="Result has expired. Submit a new request.")
     return Response(
-        content=buf.getvalue(),
+        content=job.wav_bytes,
         media_type="audio/wav",
-        headers={"X-Sample-Rate": str(sample_rate)},
+        headers={"X-Sample-Rate": str(job.sample_rate)},
     )
+
+
+@app.post("/api/tts")
+async def tts(req: TTSRequest, async_mode: bool = Query(False, alias="async")):
+    job = await jobs.submit(_generate_kwargs(req))
+    if async_mode:
+        return {"job_id": job.id, "position": job.position}
+    await job.event.wait()
+    return _job_result_response(job)
+
+
+@app.get("/api/jobs/{job_id}")
+async def job_status(job_id: str):
+    job = jobs.get(job_id)
+    body = {"status": job.status, "position": job.position}
+    if job.status == "failed":
+        body["error"] = job.error
+    return body
+
+
+@app.get("/api/jobs/{job_id}/result")
+async def job_result(job_id: str):
+    job = jobs.get(job_id)
+    if job.status in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="Job is still processing — check /api/jobs/{id} for status.")
+    return _job_result_response(job)
 
 
 @app.post("/api/tts-stream")

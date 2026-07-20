@@ -59,6 +59,19 @@ recommended way to pass reference audio. `reference_wav_path` / `prompt_wav_path
 server-side paths) only work when the server has `ALLOW_RAW_PATHS=1` set — disabled by
 default because a client-supplied path lets anyone read any file the server process can see.
 
+Requests are handled by a bounded FIFO queue (`MAX_QUEUE`, default 10) with a single
+worker, so GPU access is serialized fairly instead of rejecting concurrent requests
+outright. By default `/api/tts` enqueues the job and waits for it, so this behaves exactly
+like before — a plain request in, a wav out. Pass `?async=1` to get `{"job_id": ..., "position": N}`
+back immediately instead of waiting:
+- `GET /api/jobs/{id}` → `{"status": "queued" | "running" | "done" | "failed" | "expired", "position": N, "error"?: "..."}`
+  (`position` is 1-based while queued, 0 once running or finished)
+- `GET /api/jobs/{id}/result` → the `audio/wav` once `status` is `done` (409 while still
+  processing, 500 if `failed`, 410 once the job has passed `JOB_TTL_MIN` and expired)
+
+429 (`{"detail": "The synthesis queue is full — try again shortly."}`) only happens once
+`MAX_QUEUE` requests are already waiting — not on every concurrent request like before.
+
 ### `POST /api/upload-ref` → reference-audio upload
 Multipart form with a `file` field (WAV, MP3, FLAC, M4A, or OGG; ≤ 20 MB; ≤ 60s). The
 server converts it to 16 kHz mono WAV, stores it under `UPLOAD_DIR` with a UUID name, and
