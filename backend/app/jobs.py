@@ -43,9 +43,17 @@ _model_lock: asyncio.Lock | None = None
 
 
 def bind_model_lock(lock: asyncio.Lock) -> None:
-    """Share the same GPU-serialization lock /api/tts-stream uses."""
-    global _model_lock
+    """Called once per app lifespan startup: shares the GPU-serialization
+    lock /api/tts-stream uses, and re-creates `_wakeup`.
+
+    asyncio.Condition/Lock latch onto whichever event loop first awaits
+    them; a module-level instance created once at import time raises
+    "bound to a different event loop" the second time a fresh lifespan
+    (hence a fresh loop) uses it — e.g. once per test with TestClient, or
+    any process that re-runs the app's lifespan without restarting."""
+    global _model_lock, _wakeup
     _model_lock = lock
+    _wakeup = asyncio.Condition()
 
 
 def _renumber() -> None:
