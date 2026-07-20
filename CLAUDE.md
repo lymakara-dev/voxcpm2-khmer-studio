@@ -17,6 +17,8 @@ OpenBMB's VoxCPM2.
 ## Commands
 - Backend dev: `cd backend && pip install -r requirements.txt && uvicorn app.main:app --reload`
   (set `MOCK_TTS=1` to skip loading the real model — sine-wave audio instead)
+- Backend tests: `cd backend && pip install -r requirements-dev.txt && pytest`
+  (forces `MOCK_TTS=1` itself via `tests/conftest.py`, no GPU needed)
 - Frontend dev: `cd frontend && npm install && npm run dev`
 - Full stack: `docker compose up --build` (needs NVIDIA container toolkit, ~8 GB VRAM)
 
@@ -60,9 +62,22 @@ OpenBMB's VoxCPM2.
   would need to implement. Frontend has a gear-icon settings panel (API key
   in localStorage, attached to every request) and surfaces 401s as "Invalid
   or missing API key — add one in settings."
+- Backend pytest suite (`backend/tests/`): 35 tests over health/model-info,
+  request validation, sync + async `/api/tts`, the job queue, uploads
+  (incl. `reference_ref_id` round-trip), auth, rate limiting, and
+  `/api/tts-stream`, all against `MOCK_TTS=1`. `tests/conftest.py`'s
+  `client` fixture is **session-scoped** — the app's lifespan (and the
+  worker loop it starts) must only start once per test run, since it binds
+  module-level `asyncio.Lock`/`Condition` singletons (`jobs._wakeup`,
+  `main._model_lock`) that hang if torn down and recreated against a new
+  event loop per test. `_reset_state` (autouse) clears job/rate-limit state
+  between tests and waits out any still-running job first, so leftover
+  background work from one test can't flake the next (e.g. trip
+  `/api/tts-stream`'s lock-contention check).
 
 ## Roadmap (good next tasks)
-1. Playwright smoke test + pytest for the API.
+1. Playwright smoke test for the frontend (pytest API coverage is done —
+   see Shipped above).
 2. History panel: keep the last N generations client-side with replay.
 3. Redis-backed queue and rate limiter for multi-process/multi-replica
    deployments (both are in-process/single-worker today).

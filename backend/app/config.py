@@ -35,5 +35,5 @@ JOB_TTL_MIN = float(os.getenv("JOB_TTL_MIN", "15"))
 
 # Auth + rate limiting
 API_KEYS = {k for k in os.getenv("API_KEYS", "").split(",") if k}
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "10"))
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
 RATE_LIMIT_CHARS_PER_HOUR = int(os.getenv("RATE_LIMIT_CHARS_PER_HOUR", "20000"))
