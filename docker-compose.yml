@@ -1,0 +1,27 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      - MODEL_ID=sumnim/VoxCPM2-Khmer
+      - ALLOWED_ORIGINS=*
+    volumes:
+      - hf-cache:/models          # persist the downloaded 2B checkpoint
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:8080"
+
+volumes:
+  hf-cache:

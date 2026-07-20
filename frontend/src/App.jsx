@@ -1,0 +1,607 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+
+/* ============================================================
+   VoxCPM2-Khmer · Speech Studio
+   A control-panel dashboard for the sumnim/VoxCPM2-Khmer model
+   Modes: Speak · Voice Design · Clone · Model
+   ============================================================ */
+
+const T = {
+  bg: "#14161C",
+  bgDeep: "#0F1116",
+  surface: "#1C1F27",
+  surfaceHi: "#232735",
+  line: "#2A2E38",
+  gold: "#E3A83B",
+  goldHi: "#F0BE5C",
+  jade: "#57B99A",
+  text: "#EDE8DC",
+  muted: "#8B8FA0",
+  mutedDeep: "#5C6070",
+};
+
+const KHMER_SAMPLES = [
+  { label: "Greeting", km: "សួស្តី! សូមស្វាគមន៍មកកាន់ប្រព័ន្ធបំលែងអត្ថបទទៅជាសំឡេងភាសាខ្មែរ។" },
+  { label: "News", km: "ថ្ងៃនេះ អាកាសធាតុនៅរាជធានីភ្នំពេញ មានភ្លៀងធ្លាក់ខ្លាំងនៅពេលរសៀល។" },
+  { label: "Story", km: "កាលពីព្រេងនាយ មានព្រះរាជាមួយអង្គ គង់នៅក្នុងនគរដ៏រុងរឿងមួយ។" },
+  { label: "Numbers", km: "តម្លៃសរុបគឺ មួយពាន់ប្រាំរយហុកសិបប្រាំ រៀល។" },
+];
+
+const LANGUAGES = [
+  "Arabic","Burmese","Chinese","Danish","Dutch","English","Finnish","French","German","Greek",
+  "Hebrew","Hindi","Indonesian","Italian","Japanese","Khmer","Korean","Lao","Malay","Norwegian",
+  "Polish","Portuguese","Russian","Spanish","Swahili","Swedish","Tagalog","Thai","Turkish","Vietnamese",
+];
+
+const DESIGN_CHIPS = {
+  Voice: ["A young woman", "A young man", "An elderly man", "An elderly woman", "A child"],
+  Tone: ["gentle and sweet voice", "deep calm voice", "bright energetic voice", "warm storytelling voice"],
+  Pace: ["slow pace", "natural pace", "slightly faster"],
+  Emotion: ["cheerful tone", "serious tone", "soothing tone", "excited tone"],
+};
+
+const GEN_STEPS = ["Normalizing text", "TSLM context pass", "LocDiT diffusion sampling", "AudioVAE 48kHz decode"];
+
+/* ---------- tiny UI atoms ---------- */
+
+function Slider({ label, value, min, max, step, onChange, hint }) {
+  return (
+    <div className="ctl">
+      <div className="ctl-head">
+        <label>{label}</label>
+        <span className="mono val">{value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))} />
+      {hint && <p className="hint">{hint}</p>}
+    </div>
+  );
+}
+
+function Toggle({ label, on, onChange, hint }) {
+  return (
+    <button className={"toggle" + (on ? " on" : "")} onClick={() => onChange(!on)} aria-pressed={on}>
+      <span className="knob-track"><span className="knob" /></span>
+      <span className="toggle-body">
+        <span className="toggle-label">{label}</span>
+        {hint && <span className="hint">{hint}</span>}
+      </span>
+    </button>
+  );
+}
+
+/* ---------- waveform signature ---------- */
+
+function Waveform({ playing, seed }) {
+  const ref = useRef(null);
+  const raf = useRef(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    let t = 0;
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const draw = () => {
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      const bars = Math.floor(w / 7);
+      for (let i = 0; i < bars; i++) {
+        const x = i * 7 + 3;
+        const ph = Math.sin(i * 0.55 + seed) * 0.5 + 0.5;
+        const anim = playing ? (Math.sin(t * 0.11 + i * 0.5) * 0.5 + 0.5) : 0.18 + ph * 0.12;
+        const amp = playing ? (0.15 + 0.85 * ph * anim) : anim;
+        const bh = Math.max(2, amp * h * 0.9);
+        ctx.fillStyle = playing
+          ? (i % 9 === 0 ? T.jade : T.gold)
+          : "rgba(227,168,59,0.28)";
+        ctx.beginPath();
+        ctx.roundRect(x, (h - bh) / 2, 3.4, bh, 2);
+        ctx.fill();
+      }
+      t += 1;
+      if (playing && !reduced) raf.current = requestAnimationFrame(draw);
+    };
+    draw();
+    if (playing && !reduced) raf.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf.current);
+  }, [playing, seed]);
+  return <canvas ref={ref} className="wave" aria-hidden="true" />;
+}
+
+/* ---------- python snippet builder ---------- */
+
+function buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }) {
+  const fullText = mode === "design" && designPrefix ? `(${designPrefix})${text}` : text;
+  const esc = (s) => (s || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const lines = [
+    "import soundfile as sf",
+    "from voxcpm import VoxCPM",
+    "",
+    'model = VoxCPM.from_pretrained("sumnim/VoxCPM2-Khmer")',
+    "",
+    "wav = model.generate(",
+    `    text="${esc(fullText)}",`,
+  ];
+  if (mode === "clone" || mode === "ultimate") lines.push(`    reference_wav_path="${esc(refPath) || "speaker.wav"}",`);
+  if (mode === "ultimate") {
+    lines.push(`    prompt_wav_path="${esc(refPath) || "speaker.wav"}",`);
+    lines.push(`    prompt_text="${esc(promptText)}",`);
+  }
+  lines.push(
+    `    cfg_value=${cfg},`,
+    `    inference_timesteps=${steps},`,
+    `    normalize=${normalize ? "True" : "False"},`,
+    `    denoise=${denoise ? "True" : "False"},`,
+    `    retry_badcase=${retry ? "True" : "False"},`,
+    ")",
+    "",
+    'sf.write("output.wav", wav, model.tts_model.sample_rate)',
+  );
+  return lines.join("\n");
+}
+
+/* ---------- main ---------- */
+
+export default function VoxCPMKhmerStudio() {
+  const [tab, setTab] = useState("speak");
+  const [text, setText] = useState(KHMER_SAMPLES[0].km);
+  const [cfg, setCfg] = useState(2.0);
+  const [steps, setSteps] = useState(10);
+  const [normalize, setNormalize] = useState(true);
+  const [denoise, setDenoise] = useState(true);
+  const [retry, setRetry] = useState(true);
+  const [designSel, setDesignSel] = useState({ Voice: "A young woman", Tone: "gentle and sweet voice", Pace: null, Emotion: null });
+  const [refPath, setRefPath] = useState("");
+  const [promptText, setPromptText] = useState("");
+  const [ultimate, setUltimate] = useState(false);
+  const [endpoint, setEndpoint] = useState("/api/tts");
+  const [genState, setGenState] = useState({ status: "idle", step: 0, error: null });
+  const [audioUrl, setAudioUrl] = useState(null);
+  const [playing, setPlaying] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [seed, setSeed] = useState(1);
+  const audioRef = useRef(null);
+  const timers = useRef([]);
+
+  useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  const designPrefix = useMemo(
+    () => Object.values(designSel).filter(Boolean).join(", "),
+    [designSel]
+  );
+
+  const mode = tab === "speak" ? "speak" : tab === "design" ? "design" : ultimate ? "ultimate" : "clone";
+
+  const snippet = useMemo(
+    () => buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }),
+    [mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText]
+  );
+
+  const copySnippet = async () => {
+    try { await navigator.clipboard.writeText(snippet); } catch {
+      const ta = document.createElement("textarea");
+      ta.value = snippet; document.body.appendChild(ta); ta.select();
+      document.execCommand("copy"); document.body.removeChild(ta);
+    }
+    setCopied(true); setTimeout(() => setCopied(false), 1600);
+  };
+
+  const generate = async () => {
+    setAudioUrl(null); setPlaying(false); setSeed(Math.random() * 10);
+    timers.current.forEach(clearTimeout); timers.current = [];
+    if (endpoint.trim()) {
+      setGenState({ status: "running", step: 1, error: null });
+      try {
+        const res = await fetch(endpoint.trim(), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: mode === "design" && designPrefix ? `(${designPrefix})${text}` : text,
+            cfg_value: cfg, inference_timesteps: steps,
+            normalize, denoise, retry_badcase: retry,
+            reference_wav_path: mode === "clone" || mode === "ultimate" ? refPath || null : null,
+            prompt_wav_path: mode === "ultimate" ? refPath || null : null,
+            prompt_text: mode === "ultimate" ? promptText || null : null,
+          }),
+        });
+        if (res.status === 429) throw new Error("Server busy — another synthesis is running, try again shortly");
+        if (!res.ok) throw new Error(`Server replied ${res.status}`);
+        const blob = await res.blob();
+        setAudioUrl(URL.createObjectURL(blob));
+        setGenState({ status: "done", step: GEN_STEPS.length, error: null });
+      } catch (e) {
+        setGenState({ status: "error", step: 0, error: e.message });
+      }
+      return;
+    }
+    // Demo mode: walk through the real pipeline stages, no audio produced
+    setGenState({ status: "running", step: 0, error: null });
+    GEN_STEPS.forEach((_, i) => {
+      timers.current.push(setTimeout(() => {
+        setGenState({ status: i === GEN_STEPS.length - 1 ? "demo-done" : "running", step: i + 1, error: null });
+      }, 550 * (i + 1)));
+    });
+  };
+
+  const togglePlay = () => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (a.paused) { a.play(); setPlaying(true); } else { a.pause(); setPlaying(false); }
+  };
+
+  return (
+    <div className="root">
+      <style>{css}</style>
+
+      {/* ---------- header ---------- */}
+      <header className="head">
+        <div className="head-left">
+          <div className="glyph" aria-hidden="true">ស</div>
+          <div>
+            <div className="eyebrow">sumnim / VoxCPM2-Khmer</div>
+            <h1>Speech Studio <span className="kh-title">សំឡេង</span></h1>
+          </div>
+        </div>
+        <div className="badges">
+          <span className="badge">2B params</span>
+          <span className="badge">30 languages</span>
+          <span className="badge gold">48 kHz out</span>
+          <span className="badge">Apache-2.0</span>
+        </div>
+      </header>
+
+      <Waveform playing={genState.status === "running" || playing} seed={seed} />
+
+      {/* ---------- tabs ---------- */}
+      <nav className="tabs" role="tablist">
+        {[
+          ["speak", "Speak"],
+          ["design", "Voice design"],
+          ["clone", "Clone a voice"],
+          ["model", "Model"],
+        ].map(([id, label]) => (
+          <button key={id} role="tab" aria-selected={tab === id}
+            className={"tab" + (tab === id ? " active" : "")}
+            onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </nav>
+
+      {tab !== "model" ? (
+        <main className="grid">
+          {/* ---------- left column: input ---------- */}
+          <section className="col">
+            {tab === "design" && (
+              <div className="card">
+                <h2>Describe the voice</h2>
+                <p className="hint">Pick traits — they become the parenthesised prefix VoxCPM2 reads as a voice description. No reference audio needed.</p>
+                {Object.entries(DESIGN_CHIPS).map(([group, chips]) => (
+                  <div className="chip-row" key={group}>
+                    <span className="chip-group">{group}</span>
+                    <div className="chips">
+                      {chips.map((c) => (
+                        <button key={c}
+                          className={"chip" + (designSel[group] === c ? " sel" : "")}
+                          onClick={() => setDesignSel((s) => ({ ...s, [group]: s[group] === c ? null : c }))}>
+                          {c}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+                {designPrefix && <div className="prefix mono">({designPrefix})</div>}
+              </div>
+            )}
+
+            {tab === "clone" && (
+              <div className="card">
+                <h2>Reference voice</h2>
+                <label className="field-label" htmlFor="ref">Reference audio path (.wav, 16 kHz accepted)</label>
+                <input id="ref" className="field mono" placeholder="speaker.wav" value={refPath}
+                  onChange={(e) => setRefPath(e.target.value)} />
+                <Toggle label="Ultimate cloning" on={ultimate} onChange={setUltimate}
+                  hint="Adds the reference transcript for audio-continuation cloning — highest fidelity." />
+                {ultimate && (
+                  <>
+                    <label className="field-label" htmlFor="ptext">Reference transcript</label>
+                    <textarea id="ptext" className="field" rows={2} value={promptText}
+                      placeholder="Exact transcript of the reference clip"
+                      onChange={(e) => setPromptText(e.target.value)} />
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="card">
+              <h2>{tab === "speak" ? "Text to speak" : "Content to synthesize"}</h2>
+              <div className="samples">
+                {KHMER_SAMPLES.map((s) => (
+                  <button key={s.label} className="chip" onClick={() => setText(s.km)}>{s.label}</button>
+                ))}
+              </div>
+              <textarea className="field kh" rows={4} value={text} onChange={(e) => setText(e.target.value)}
+                placeholder="វាយអត្ថបទខ្មែរនៅទីនេះ… (or any of the 30 supported languages)" />
+              <p className="hint">No language tag needed — the model detects Khmer (or any supported language) from the text itself.</p>
+            </div>
+
+            <div className="card">
+              <h2>Sampling</h2>
+              <Slider label="cfg_value" value={cfg} min={1} max={4} step={0.1} onChange={setCfg}
+                hint="Guidance strength on LocDiT. Higher follows the prompt more closely; too high can degrade quality." />
+              <Slider label="inference_timesteps" value={steps} min={4} max={32} step={1} onChange={setSteps}
+                hint="Diffusion steps. Higher = better quality, lower = faster." />
+              <div className="toggle-grid">
+                <Toggle label="Normalize text" on={normalize} onChange={setNormalize} />
+                <Toggle label="Denoise" on={denoise} onChange={setDenoise} />
+                <Toggle label="Retry bad cases" on={retry} onChange={setRetry} />
+              </div>
+            </div>
+          </section>
+
+          {/* ---------- right column: output ---------- */}
+          <section className="col">
+            <div className="card">
+              <h2>Generate</h2>
+              <label className="field-label" htmlFor="ep">Inference endpoint <span className="opt">optional</span></label>
+              <input id="ep" className="field mono" placeholder="https://your-server/tts  (POST, returns audio)"
+                value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
+              <p className="hint">Leave empty to preview the pipeline in demo mode. The model itself runs on a GPU server (~8 GB VRAM) — point this at your VoxCPM endpoint to get real audio back.</p>
+              <button className="cta" onClick={generate} disabled={genState.status === "running" || !text.trim()}>
+                {genState.status === "running" ? "Synthesizing…" : "Generate speech"}
+              </button>
+
+              <ol className="pipeline">
+                {GEN_STEPS.map((s, i) => (
+                  <li key={s} className={genState.step > i ? "done" : genState.status === "running" && genState.step === i ? "now" : ""}>
+                    <span className="dot" />{s}
+                  </li>
+                ))}
+              </ol>
+
+              {genState.status === "demo-done" && (
+                <div className="note">Demo run complete — no endpoint set, so no audio was produced. Copy the Python below to run the real thing, or connect an endpoint above.</div>
+              )}
+              {genState.status === "error" && (
+                <div className="note err">Endpoint request failed: {genState.error}. Check the URL, CORS headers, and that the server returns an audio blob.</div>
+              )}
+              {audioUrl && (
+                <div className="player">
+                  <button className="play" onClick={togglePlay} aria-label={playing ? "Pause" : "Play"}>
+                    {playing ? "❚❚" : "▶"}
+                  </button>
+                  <span>output.wav · 48 kHz</span>
+                  <a className="dl" href={audioUrl} download="output.wav">Download</a>
+                  <audio ref={audioRef} src={audioUrl} onEnded={() => setPlaying(false)} />
+                </div>
+              )}
+            </div>
+
+            <div className="card code-card">
+              <div className="code-head">
+                <h2>Python · voxcpm</h2>
+                <button className="copy" onClick={copySnippet}>{copied ? "Copied ✓" : "Copy"}</button>
+              </div>
+              <pre className="mono code">{snippet}</pre>
+              <p className="hint">Mirrors every control above. <span className="mono">pip install voxcpm</span> · Python ≥ 3.10 · PyTorch ≥ 2.5 · CUDA ≥ 12.</p>
+            </div>
+          </section>
+        </main>
+      ) : (
+        /* ---------- model tab ---------- */
+        <main className="grid">
+          <section className="col">
+            <div className="card">
+              <h2>Architecture</h2>
+              <table className="spec">
+                <tbody>
+                  {[
+                    ["Pipeline", "LocEnc → TSLM → RALM → LocDiT (tokenizer-free diffusion AR)"],
+                    ["Backbone", "MiniCPM-4 · 2B parameters · bfloat16"],
+                    ["Audio VAE", "AudioVAE V2 — 16 kHz in, 48 kHz out (built-in super-resolution)"],
+                    ["Training data", "2M+ hours multilingual speech"],
+                    ["LM token rate", "6.25 Hz"],
+                    ["Max sequence", "8192 tokens"],
+                    ["VRAM", "~8 GB"],
+                    ["RTF (RTX 4090)", "~0.30 standard · ~0.13 with Nano-vLLM"],
+                    ["License", "Apache-2.0 — free for commercial use"],
+                  ].map(([k, v]) => (
+                    <tr key={k}><th>{k}</th><td>{v}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="card">
+              <h2>Fine-tuning</h2>
+              <p className="body">Supports full SFT and LoRA fine-tuning with as little as 5–10 minutes of audio — which is exactly how a Khmer-specialized checkpoint like this one comes about.</p>
+              <pre className="mono code small">{`python scripts/train_voxcpm_finetune.py \\
+    --config_path conf/voxcpm_v2/voxcpm_finetune_lora.yaml`}</pre>
+            </div>
+          </section>
+          <section className="col">
+            <div className="card">
+              <h2>30 languages</h2>
+              <div className="langs">
+                {LANGUAGES.map((l) => (
+                  <span key={l} className={"lang" + (l === "Khmer" ? " km-hl" : "")}>{l}</span>
+                ))}
+              </div>
+              <p className="hint">Plus 9 Chinese dialects. Khmer is this checkpoint's specialty.</p>
+            </div>
+            <div className="card">
+              <h2>Responsible use</h2>
+              <p className="body">The model card strictly forbids use for impersonation, fraud, or disinformation. Label AI-generated speech clearly, and get consent before cloning anyone's voice.</p>
+            </div>
+            <div className="card">
+              <h2>Links</h2>
+              <ul className="links">
+                <li><a href="https://huggingface.co/sumnim/VoxCPM2-Khmer" target="_blank" rel="noreferrer">Model card on Hugging Face</a></li>
+                <li><a href="https://github.com/OpenBMB/VoxCPM" target="_blank" rel="noreferrer">VoxCPM on GitHub</a></li>
+                <li><a href="https://voxcpm.readthedocs.io/en/latest/" target="_blank" rel="noreferrer">Documentation</a></li>
+                <li><a href="https://huggingface.co/papers/2509.24650" target="_blank" rel="noreferrer">Paper · arXiv 2509.24650</a></li>
+              </ul>
+            </div>
+          </section>
+        </main>
+      )}
+
+      <footer className="foot">
+        <span>VoxCPM2-Khmer · tokenizer-free diffusion TTS · fine-tuned checkpoint by sumnim on OpenBMB's VoxCPM2</span>
+      </footer>
+    </div>
+  );
+}
+
+/* ---------- styles ---------- */
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+Khmer:wght@400;600&display=swap');
+
+.root {
+  min-height: 100vh;
+  background:
+    radial-gradient(1100px 500px at 85% -10%, rgba(227,168,59,0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(87,185,154,0.05), transparent 60%),
+    ${T.bg};
+  color: ${T.text};
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  padding: 28px clamp(16px, 4vw, 48px) 40px;
+}
+.root * { box-sizing: border-box; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+.kh, .kh-title { font-family: 'Noto Sans Khmer', 'Inter', sans-serif; }
+
+.head { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+.head-left { display: flex; gap: 16px; align-items: center; }
+.glyph {
+  width: 56px; height: 56px; border-radius: 14px; flex: none;
+  display: grid; place-items: center;
+  font-family: 'Noto Sans Khmer', sans-serif; font-size: 30px; font-weight: 600;
+  color: ${T.bgDeep};
+  background: linear-gradient(140deg, ${T.goldHi}, ${T.gold} 55%, #B87F1F);
+  box-shadow: 0 6px 24px rgba(227,168,59,0.25);
+}
+.eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.08em; color: ${T.muted}; text-transform: uppercase; }
+h1 { font-family: 'Space Grotesk', sans-serif; font-size: clamp(22px, 3.4vw, 30px); font-weight: 700; margin: 2px 0 0; letter-spacing: -0.01em; }
+.kh-title { color: ${T.gold}; font-weight: 600; margin-left: 8px; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.badge { padding: 5px 11px; border: 1px solid ${T.line}; border-radius: 99px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: ${T.muted}; background: ${T.surface}; }
+.badge.gold { color: ${T.gold}; border-color: rgba(227,168,59,0.4); }
+
+.wave { width: 100%; height: 56px; display: block; margin-bottom: 20px; }
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid ${T.line}; margin-bottom: 22px; overflow-x: auto; }
+.tab {
+  appearance: none; background: none; border: none; cursor: pointer;
+  font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 500;
+  color: ${T.muted}; padding: 10px 16px 12px;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap;
+}
+.tab:hover { color: ${T.text}; }
+.tab.active { color: ${T.gold}; border-bottom-color: ${T.gold}; }
+.tab:focus-visible, .chip:focus-visible, .cta:focus-visible, .toggle:focus-visible, .copy:focus-visible, .play:focus-visible {
+  outline: 2px solid ${T.jade}; outline-offset: 2px; border-radius: 6px;
+}
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+@media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+.col { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+
+.card { background: ${T.surface}; border: 1px solid ${T.line}; border-radius: 14px; padding: 18px 18px 16px; }
+.card h2 { font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: ${T.text}; margin: 0 0 12px; }
+.hint { font-size: 12px; color: ${T.muted}; line-height: 1.5; margin: 6px 0 0; }
+.body { font-size: 13.5px; line-height: 1.6; color: ${T.text}; margin: 0 0 10px; }
+
+.samples { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.chip {
+  appearance: none; cursor: pointer; font: inherit; font-size: 12px;
+  color: ${T.muted}; background: ${T.surfaceHi}; border: 1px solid ${T.line};
+  border-radius: 99px; padding: 5px 12px; transition: all .12s ease;
+}
+.chip:hover { color: ${T.text}; border-color: ${T.mutedDeep}; }
+.chip.sel { color: ${T.bgDeep}; background: ${T.gold}; border-color: ${T.gold}; font-weight: 600; }
+.chip-row { display: flex; gap: 10px; align-items: baseline; margin-bottom: 10px; flex-wrap: wrap; }
+.chip-group { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${T.mutedDeep}; text-transform: uppercase; letter-spacing: .06em; width: 62px; flex: none; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.prefix { margin-top: 8px; padding: 8px 12px; border-radius: 8px; background: ${T.bgDeep}; color: ${T.jade}; font-size: 12.5px; }
+
+.field {
+  width: 100%; background: ${T.bgDeep}; color: ${T.text};
+  border: 1px solid ${T.line}; border-radius: 10px;
+  padding: 11px 13px; font: inherit; font-size: 14px; line-height: 1.6;
+  resize: vertical;
+}
+.field:focus { outline: none; border-color: ${T.gold}; }
+.field.kh { font-size: 16px; }
+.field-label { display: block; font-size: 12px; color: ${T.muted}; margin: 10px 0 6px; }
+.opt { color: ${T.mutedDeep}; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; margin-left: 6px; }
+
+.ctl { margin-bottom: 14px; }
+.ctl-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.ctl-head label { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: ${T.text}; }
+.val { color: ${T.gold}; font-size: 13px; }
+input[type=range] { width: 100%; accent-color: ${T.gold}; height: 22px; cursor: pointer; background: transparent; }
+
+.toggle-grid { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.toggle { display: flex; gap: 10px; align-items: flex-start; appearance: none; background: none; border: none; cursor: pointer; padding: 7px 2px; text-align: left; color: ${T.text}; font: inherit; }
+.knob-track { width: 34px; height: 19px; border-radius: 99px; background: ${T.line}; flex: none; position: relative; transition: background .15s; margin-top: 1px; }
+.toggle.on .knob-track { background: ${T.jade}; }
+.knob { position: absolute; top: 2.5px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: ${T.text}; transition: transform .15s; }
+.toggle.on .knob { transform: translateX(14px); background: ${T.bgDeep}; }
+.toggle-body { display: flex; flex-direction: column; gap: 1px; }
+.toggle-label { font-size: 13.5px; }
+.toggle .hint { margin: 1px 0 0; }
+
+.cta {
+  width: 100%; margin-top: 14px; padding: 13px;
+  font-family: 'Space Grotesk', sans-serif; font-size: 15px; font-weight: 700;
+  color: ${T.bgDeep}; background: linear-gradient(135deg, ${T.goldHi}, ${T.gold});
+  border: none; border-radius: 11px; cursor: pointer; transition: filter .12s, transform .12s;
+}
+.cta:hover:not(:disabled) { filter: brightness(1.07); transform: translateY(-1px); }
+.cta:disabled { opacity: .45; cursor: not-allowed; }
+
+.pipeline { list-style: none; margin: 16px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.pipeline li { display: flex; align-items: center; gap: 10px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: ${T.mutedDeep}; }
+.pipeline .dot { width: 8px; height: 8px; border-radius: 50%; background: ${T.line}; flex: none; transition: background .2s; }
+.pipeline li.now { color: ${T.gold}; }
+.pipeline li.now .dot { background: ${T.gold}; animation: pulse 1s ease infinite; }
+.pipeline li.done { color: ${T.jade}; }
+.pipeline li.done .dot { background: ${T.jade}; }
+@keyframes pulse { 50% { opacity: .4; } }
+@media (prefers-reduced-motion: reduce) { .pipeline li.now .dot { animation: none; } .cta:hover { transform: none; } }
+
+.note { margin-top: 14px; padding: 11px 13px; border-radius: 10px; font-size: 12.5px; line-height: 1.55; background: rgba(87,185,154,0.09); border: 1px solid rgba(87,185,154,0.3); color: ${T.text}; }
+.note.err { background: rgba(224,108,92,0.09); border-color: rgba(224,108,92,0.4); }
+
+.player { margin-top: 14px; display: flex; align-items: center; gap: 12px; padding: 10px 13px; background: ${T.bgDeep}; border: 1px solid ${T.line}; border-radius: 10px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: ${T.muted}; }
+.play { width: 38px; height: 38px; border-radius: 50%; border: none; cursor: pointer; background: ${T.gold}; color: ${T.bgDeep}; font-size: 13px; flex: none; }
+.dl { margin-left: auto; color: ${T.jade}; text-decoration: none; }
+.dl:hover { text-decoration: underline; }
+
+.code-card { position: sticky; top: 16px; }
+.code-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.code-head h2 { margin: 0; }
+.copy { appearance: none; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: ${T.muted}; background: ${T.surfaceHi}; border: 1px solid ${T.line}; border-radius: 7px; padding: 5px 11px; }
+.copy:hover { color: ${T.gold}; border-color: rgba(227,168,59,0.4); }
+.code { background: ${T.bgDeep}; border: 1px solid ${T.line}; border-radius: 10px; padding: 14px; font-size: 12px; line-height: 1.65; color: #C9D2E3; overflow-x: auto; margin: 0; white-space: pre; }
+.code.small { font-size: 11.5px; margin-top: 4px; }
+
+.spec { width: 100%; border-collapse: collapse; font-size: 13px; }
+.spec th { text-align: left; font-family: 'JetBrains Mono', monospace; font-weight: 500; font-size: 11.5px; color: ${T.muted}; padding: 8px 14px 8px 0; vertical-align: top; white-space: nowrap; }
+.spec td { padding: 8px 0; color: ${T.text}; line-height: 1.5; border-bottom: 1px solid ${T.line}; }
+.spec th { border-bottom: 1px solid ${T.line}; }
+.spec tr:last-child th, .spec tr:last-child td { border-bottom: none; }
+
+.langs { display: flex; flex-wrap: wrap; gap: 6px; }
+.lang { padding: 5px 11px; border-radius: 99px; font-size: 12px; background: ${T.surfaceHi}; border: 1px solid ${T.line}; color: ${T.muted}; }
+.lang.km-hl { background: ${T.gold}; color: ${T.bgDeep}; border-color: ${T.gold}; font-weight: 600; }
+
+.links { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; font-size: 13.5px; }
+.links a { color: ${T.jade}; text-decoration: none; }
+.links a:hover { text-decoration: underline; color: ${T.gold}; }
+
+.foot { margin-top: 26px; padding-top: 14px; border-top: 1px solid ${T.line}; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${T.mutedDeep}; }
+`;
