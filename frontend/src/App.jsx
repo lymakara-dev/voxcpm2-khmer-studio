@@ -111,6 +111,63 @@ function Waveform({ playing, seed }) {
   return <canvas ref={ref} className="wave" aria-hidden="true" />;
 }
 
+/* ---------- reference-audio upload zone ---------- */
+
+function humanSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function UploadZone({ refInfo, uploading, progress, error, onFile, onRemove }) {
+  const inputRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  if (refInfo) {
+    return (
+      <div className="upload-done">
+        <div className="upload-done-info">
+          <span className="upload-name mono">{refInfo.filename}</span>
+          <span className="upload-meta mono">{refInfo.duration_s.toFixed(1)}s</span>
+        </div>
+        <button className="upload-remove" onClick={onRemove} aria-label="Remove reference audio">Remove</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div
+        className={"dropzone" + (dragOver ? " over" : "")}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault(); setDragOver(false);
+          const f = e.dataTransfer.files?.[0];
+          if (f) onFile(f);
+        }}
+        role="button" tabIndex={0}
+      >
+        {uploading ? (
+          <>
+            <div className="upload-bar"><div className="upload-bar-fill" style={{ width: `${progress}%` }} /></div>
+            <p className="hint">Uploading… {progress}%</p>
+          </>
+        ) : (
+          <>
+            <p className="dropzone-label">Drop a reference clip here, or click to browse</p>
+            <p className="hint">WAV, MP3, FLAC, M4A, or OGG — up to 20 MB, 60s</p>
+          </>
+        )}
+      </div>
+      <input ref={inputRef} type="file" accept=".wav,.mp3,.flac,.m4a,.ogg" style={{ display: "none" }}
+        onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = ""; }} />
+      {error && <div className="note err">{error}</div>}
+    </div>
+  );
+}
+
 /* ---------- python snippet builder ---------- */
 
 function buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }) {
@@ -155,6 +212,12 @@ export default function VoxCPMKhmerStudio() {
   const [retry, setRetry] = useState(true);
   const [designSel, setDesignSel] = useState({ Voice: "A young woman", Tone: "gentle and sweet voice", Pace: null, Emotion: null });
   const [refPath, setRefPath] = useState("");
+  const [showAdvancedPath, setShowAdvancedPath] = useState(false);
+  const [refInfo, setRefInfo] = useState(null); // { ref_id, duration_s, filename }
+  const [refUploading, setRefUploading] = useState(false);
+  const [refUploadProgress, setRefUploadProgress] = useState(0);
+  const [refUploadError, setRefUploadError] = useState(null);
+  const [modelInfo, setModelInfo] = useState(null);
   const [promptText, setPromptText] = useState("");
   const [ultimate, setUltimate] = useState(false);
   const [endpoint, setEndpoint] = useState("/api/tts");
@@ -168,16 +231,50 @@ export default function VoxCPMKhmerStudio() {
 
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
+  useEffect(() => {
+    fetch("/api/model-info").then((r) => (r.ok ? r.json() : null)).then(setModelInfo).catch(() => setModelInfo(null));
+  }, []);
+
+  const uploadRef = (file) => {
+    setRefUploadError(null);
+    setRefUploading(true);
+    setRefUploadProgress(0);
+    const form = new FormData();
+    form.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload-ref");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) setRefUploadProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      setRefUploading(false);
+      let body = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* ignore */ }
+      if (xhr.status >= 200 && xhr.status < 300 && body) {
+        setRefInfo(body);
+      } else {
+        setRefUploadError(body?.detail || `Upload failed (server replied ${xhr.status})`);
+      }
+    };
+    xhr.onerror = () => { setRefUploading(false); setRefUploadError("Upload failed — network error."); };
+    xhr.send(form);
+  };
+
+  const removeRef = () => { setRefInfo(null); setRefUploadError(null); };
+
   const designPrefix = useMemo(
     () => Object.values(designSel).filter(Boolean).join(", "),
     [designSel]
   );
 
   const mode = tab === "speak" ? "speak" : tab === "design" ? "design" : ultimate ? "ultimate" : "clone";
+  const needsRef = mode === "clone" || mode === "ultimate";
+  const hasRef = Boolean(refInfo) || (showAdvancedPath && refPath.trim());
+  const snippetRefPath = refPath || refInfo?.filename || "";
 
   const snippet = useMemo(
-    () => buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText }),
-    [mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath, promptText]
+    () => buildSnippet({ mode, text, designPrefix, cfg, steps, normalize, denoise, retry, refPath: snippetRefPath, promptText }),
+    [mode, text, designPrefix, cfg, steps, normalize, denoise, retry, snippetRefPath, promptText]
   );
 
   const copySnippet = async () => {
@@ -194,6 +291,8 @@ export default function VoxCPMKhmerStudio() {
     timers.current.forEach(clearTimeout); timers.current = [];
     if (endpoint.trim()) {
       setGenState({ status: "running", step: 1, error: null });
+      const isCloneMode = mode === "clone" || mode === "ultimate";
+      const usingRawPath = isCloneMode && showAdvancedPath && refPath.trim();
       try {
         const res = await fetch(endpoint.trim(), {
           method: "POST",
@@ -202,13 +301,19 @@ export default function VoxCPMKhmerStudio() {
             text: mode === "design" && designPrefix ? `(${designPrefix})${text}` : text,
             cfg_value: cfg, inference_timesteps: steps,
             normalize, denoise, retry_badcase: retry,
-            reference_wav_path: mode === "clone" || mode === "ultimate" ? refPath || null : null,
-            prompt_wav_path: mode === "ultimate" ? refPath || null : null,
+            reference_wav_path: usingRawPath ? refPath.trim() : null,
+            prompt_wav_path: mode === "ultimate" && usingRawPath ? refPath.trim() : null,
+            reference_ref_id: isCloneMode && !usingRawPath ? refInfo?.ref_id || null : null,
+            prompt_ref_id: mode === "ultimate" && !usingRawPath ? refInfo?.ref_id || null : null,
             prompt_text: mode === "ultimate" ? promptText || null : null,
           }),
         });
         if (res.status === 429) throw new Error("Server busy — another synthesis is running, try again shortly");
-        if (!res.ok) throw new Error(`Server replied ${res.status}`);
+        if (!res.ok) {
+          let detail = `Server replied ${res.status}`;
+          try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+          throw new Error(detail);
+        }
         const blob = await res.blob();
         setAudioUrl(URL.createObjectURL(blob));
         setGenState({ status: "done", step: GEN_STEPS.length, error: null });
@@ -298,9 +403,22 @@ export default function VoxCPMKhmerStudio() {
             {tab === "clone" && (
               <div className="card">
                 <h2>Reference voice</h2>
-                <label className="field-label" htmlFor="ref">Reference audio path (.wav, 16 kHz accepted)</label>
-                <input id="ref" className="field mono" placeholder="speaker.wav" value={refPath}
-                  onChange={(e) => setRefPath(e.target.value)} />
+                <UploadZone refInfo={refInfo} uploading={refUploading} progress={refUploadProgress}
+                  error={refUploadError} onFile={uploadRef} onRemove={removeRef} />
+                {modelInfo?.allow_raw_paths && (
+                  <>
+                    <button className="disclosure" onClick={() => setShowAdvancedPath((v) => !v)}>
+                      {showAdvancedPath ? "▾" : "▸"} Advanced: server path
+                    </button>
+                    {showAdvancedPath && (
+                      <>
+                        <label className="field-label" htmlFor="ref">Reference audio path on the server</label>
+                        <input id="ref" className="field mono" placeholder="/data/speaker.wav" value={refPath}
+                          onChange={(e) => setRefPath(e.target.value)} />
+                      </>
+                    )}
+                  </>
+                )}
                 <Toggle label="Ultimate cloning" on={ultimate} onChange={setUltimate}
                   hint="Adds the reference transcript for audio-continuation cloning — highest fidelity." />
                 {ultimate && (
@@ -348,9 +466,11 @@ export default function VoxCPMKhmerStudio() {
               <input id="ep" className="field mono" placeholder="https://your-server/tts  (POST, returns audio)"
                 value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
               <p className="hint">Leave empty to preview the pipeline in demo mode. The model itself runs on a GPU server (~8 GB VRAM) — point this at your VoxCPM endpoint to get real audio back.</p>
-              <button className="cta" onClick={generate} disabled={genState.status === "running" || !text.trim()}>
+              <button className="cta" onClick={generate}
+                disabled={genState.status === "running" || !text.trim() || (needsRef && !hasRef)}>
                 {genState.status === "running" ? "Synthesizing…" : "Generate speech"}
               </button>
+              {needsRef && !hasRef && <p className="hint">Upload a reference clip (or set a server path) to generate.</p>}
 
               <ol className="pipeline">
                 {GEN_STEPS.map((s, i) => (
@@ -526,6 +646,24 @@ h1 { font-family: 'Space Grotesk', sans-serif; font-size: clamp(22px, 3.4vw, 30p
 .chip-group { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: ${T.mutedDeep}; text-transform: uppercase; letter-spacing: .06em; width: 62px; flex: none; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .prefix { margin-top: 8px; padding: 8px 12px; border-radius: 8px; background: ${T.bgDeep}; color: ${T.jade}; font-size: 12.5px; }
+
+.dropzone {
+  cursor: pointer; text-align: center; padding: 22px 14px;
+  border: 1.5px dashed ${T.line}; border-radius: 12px; background: ${T.bgDeep};
+  transition: border-color .12s, background .12s;
+}
+.dropzone:hover, .dropzone.over { border-color: ${T.gold}; background: rgba(227,168,59,0.06); }
+.dropzone-label { font-size: 13.5px; color: ${T.text}; margin: 0 0 4px; }
+.upload-bar { width: 100%; height: 6px; border-radius: 99px; background: ${T.line}; overflow: hidden; margin-bottom: 8px; }
+.upload-bar-fill { height: 100%; background: ${T.gold}; transition: width .15s; }
+.upload-done { display: flex; align-items: center; gap: 10px; padding: 10px 13px; background: ${T.bgDeep}; border: 1px solid ${T.line}; border-radius: 10px; }
+.upload-done-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.upload-name { font-size: 13px; color: ${T.text}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-meta { font-size: 11.5px; color: ${T.muted}; }
+.upload-remove { appearance: none; cursor: pointer; font-size: 11.5px; color: ${T.muted}; background: ${T.surfaceHi}; border: 1px solid ${T.line}; border-radius: 7px; padding: 6px 11px; flex: none; }
+.upload-remove:hover { color: #E06C5C; border-color: rgba(224,108,92,0.4); }
+.disclosure { appearance: none; cursor: pointer; background: none; border: none; color: ${T.muted}; font-size: 12px; padding: 10px 0 2px; font-family: 'JetBrains Mono', monospace; }
+.disclosure:hover { color: ${T.text}; }
 
 .field {
   width: 100%; background: ${T.bgDeep}; color: ${T.text};

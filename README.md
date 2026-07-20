@@ -27,6 +27,8 @@ Open http://localhost:8080
 cd backend
 pip install -r requirements.txt
 uvicorn app.main:app --reload
+# no GPU? set MOCK_TTS=1 to skip loading the real model and get a synthetic
+# sine-wave clip back instead — same API shape, useful for frontend dev/CI.
 
 # terminal 2 — UI on :5173 (proxies /api to :8000)
 cd frontend
@@ -35,7 +37,8 @@ npm run dev
 ```
 
 ## API
-`POST /api/tts` → `audio/wav`
+
+### `POST /api/tts` → `audio/wav`
 ```json
 {
   "text": "សួស្តី! សូមស្វាគមន៍",
@@ -46,10 +49,31 @@ npm run dev
   "retry_badcase": true,
   "reference_wav_path": null,
   "prompt_wav_path": null,
-  "prompt_text": null
+  "prompt_text": null,
+  "reference_ref_id": null,
+  "prompt_ref_id": null
 }
 ```
-`GET /api/health` · `GET /api/model-info`
+`reference_ref_id` / `prompt_ref_id` are ids returned by `POST /api/upload-ref` and are the
+recommended way to pass reference audio. `reference_wav_path` / `prompt_wav_path` (raw
+server-side paths) only work when the server has `ALLOW_RAW_PATHS=1` set — disabled by
+default because a client-supplied path lets anyone read any file the server process can see.
+
+### `POST /api/upload-ref` → reference-audio upload
+Multipart form with a `file` field (WAV, MP3, FLAC, M4A, or OGG; ≤ 20 MB; ≤ 60s). The
+server converts it to 16 kHz mono WAV, stores it under `UPLOAD_DIR` with a UUID name, and
+deletes it after `UPLOAD_TTL_HOURS` (default 24h).
+```json
+{ "ref_id": "5f2c...", "duration_s": 4.2, "filename": "speaker.wav" }
+```
+Use `ref_id` as `reference_ref_id` / `prompt_ref_id` in a subsequent `/api/tts` call.
+
+### `GET /api/health` · `GET /api/model-info`
+`model-info` includes `allow_raw_paths` and `mock` so the frontend can adapt its UI
+(e.g. only showing the raw server-path field when raw paths are actually accepted).
+
+All error responses are `{"detail": "<human-readable message>"}` — the frontend shows
+`detail` verbatim, so backend errors should be written for end users, not developers.
 
 ## Responsible use
 The model license forbids impersonation, fraud, and disinformation.
