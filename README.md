@@ -92,11 +92,27 @@ still works. Returns 429 (same `detail` shape as `/api/tts`) if a synthesis is a
 in progress.
 
 ### `GET /api/health` · `GET /api/model-info`
-`model-info` includes `allow_raw_paths` and `mock` so the frontend can adapt its UI
-(e.g. only showing the raw server-path field when raw paths are actually accepted).
+`model-info` includes `allow_raw_paths`, `mock`, and `auth_required` so the frontend can
+adapt its UI (raw-path field, mock badge, whether to prompt for an API key). Both routes
+are always open — no API key needed even when `API_KEYS` is set.
 
 All error responses are `{"detail": "<human-readable message>"}` — the frontend shows
 `detail` verbatim, so backend errors should be written for end users, not developers.
+
+### Auth + rate limiting
+Every route above except `/api/health` and `/api/model-info` is gated by `API_KEYS`: unset
+(the default) disables auth entirely; set it to a comma-separated list of keys and those
+routes require `Authorization: Bearer <key>` or `X-API-Key: <key>`, returning 401 otherwise.
+
+Every caller — identified by API key when auth is on, by client IP when it's off — is also
+sliding-window rate limited:
+- `RATE_LIMIT_PER_MIN` (default 10) requests per minute
+- `RATE_LIMIT_CHARS_PER_HOUR` (default 20000) characters of `text` per hour, on `/api/tts`
+  and `/api/tts-stream` only, since cost scales with text length
+
+Both return 429 with a `Retry-After` header (seconds) once exceeded. The limiter
+(`app/auth.py::SlidingWindowLimiter`) is in-memory and per-process; swap it for a
+Redis-backed implementation to share limits across multiple replicas.
 
 ## Responsible use
 The model license forbids impersonation, fraud, and disinformation.

@@ -50,10 +50,19 @@ OpenBMB's VoxCPM2.
   result (results expire after `JOB_TTL_MIN`). The worker shares `_model_lock`
   with `/api/tts-stream` so the two paths never run generation concurrently.
   Frontend polls every 1.5s and shows "In queue — position N" while queued.
+- Auth + rate limiting (`app/auth.py`): `API_KEYS` (unset = disabled, the
+  dev default) gates every route except `/api/health` and `/api/model-info`
+  behind `Authorization: Bearer <key>` / `X-API-Key`. Every caller (by key,
+  or by IP when auth is off) is sliding-window rate limited —
+  `RATE_LIMIT_PER_MIN` requests/min and `RATE_LIMIT_CHARS_PER_HOUR` on
+  `/api/tts*` — both returning 429 + `Retry-After`. In-memory now;
+  `SlidingWindowLimiter.check()` is the whole interface a Redis-backed swap
+  would need to implement. Frontend has a gear-icon settings panel (API key
+  in localStorage, attached to every request) and surfaces 401s as "Invalid
+  or missing API key — add one in settings."
 
 ## Roadmap (good next tasks)
-1. Rate limiting + API key auth for public deployments.
-2. Playwright smoke test + pytest for the API.
-3. History panel: keep the last N generations client-side with replay.
-4. Redis-backed queue for multi-process/multi-replica deployments (current
-   queue is in-process, single-worker only).
+1. Playwright smoke test + pytest for the API.
+2. History panel: keep the last N generations client-side with replay.
+3. Redis-backed queue and rate limiter for multi-process/multi-replica
+   deployments (both are in-process/single-worker today).

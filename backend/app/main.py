@@ -18,6 +18,12 @@ queued work.
 Set MOCK_TTS=1 to skip loading the real model entirely and return a
 synthetic sine-wave clip instead — used for frontend dev without a GPU,
 CI, and the test suite.
+
+If API_KEYS is set, all routes above except /api/health and /api/model-info
+require an API key (Authorization: Bearer <key> or X-API-Key); unset
+(the default) disables auth entirely. Every caller — keyed by API key when
+auth is on, by IP otherwise — is also sliding-window rate limited
+(RATE_LIMIT_PER_MIN requests/min, RATE_LIMIT_CHARS_PER_HOUR characters/hour).
 """
 
 from __future__ import annotations
@@ -27,12 +33,12 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Response, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from . import config, errors, jobs, uploads
+from . import auth, config, errors, jobs, uploads
 from .tts_model import get_model, is_loaded, stream_pcm16
 
 logger = logging.getLogger("voxcpm-server")
@@ -111,11 +117,13 @@ async def model_info():
         "license": "apache-2.0",
         "allow_raw_paths": config.ALLOW_RAW_PATHS,
         "mock": config.MOCK_TTS,
+        "auth_required": bool(config.API_KEYS),
     }
 
 
 @app.post("/api/upload-ref")
-async def upload_ref(file: UploadFile):
+async def upload_ref(file: UploadFile, identity: str = Depends(auth.require_identity)):
+    auth.enforce_request_rate(identity)
     return await uploads.save_upload(file)
 
 
@@ -150,7 +158,13 @@ def _job_result_response(job: jobs.Job) -> Response:
 
 
 @app.post("/api/tts")
-async def tts(req: TTSRequest, async_mode: bool = Query(False, alias="async")):
+async def tts(
+    req: TTSRequest,
+    async_mode: bool = Query(False, alias="async"),
+    identity: str = Depends(auth.require_identity),
+):
+    auth.enforce_request_rate(identity)
+    auth.enforce_char_rate(identity, len(req.text))
     job = await jobs.submit(_generate_kwargs(req))
     if async_mode:
         return {"job_id": job.id, "position": job.position}
@@ -159,7 +173,8 @@ async def tts(req: TTSRequest, async_mode: bool = Query(False, alias="async")):
 
 
 @app.get("/api/jobs/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, identity: str = Depends(auth.require_identity)):
+    auth.enforce_request_rate(identity)
     job = jobs.get(job_id)
     body = {"status": job.status, "position": job.position}
     if job.status == "failed":
@@ -168,7 +183,8 @@ async def job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/result")
-async def job_result(job_id: str):
+async def job_result(job_id: str, identity: str = Depends(auth.require_identity)):
+    auth.enforce_request_rate(identity)
     job = jobs.get(job_id)
     if job.status in ("queued", "running"):
         raise HTTPException(status_code=409, detail="Job is still processing — check /api/jobs/{id} for status.")
@@ -176,10 +192,12 @@ async def job_result(job_id: str):
 
 
 @app.post("/api/tts-stream")
-async def tts_stream(req: TTSRequest):
+async def tts_stream(req: TTSRequest, identity: str = Depends(auth.require_identity)):
     """Chunked raw 16-bit little-endian PCM, mono, at the rate in
     X-Sample-Rate. Not a WAV container — a WAV header needs the total
     length up front, which streaming can't provide."""
+    auth.enforce_request_rate(identity)
+    auth.enforce_char_rate(identity, len(req.text))
     model = await get_model()
 
     if _model_lock.locked():

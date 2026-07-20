@@ -42,6 +42,8 @@ const DESIGN_CHIPS = {
 
 const GEN_STEPS = ["Normalizing text", "TSLM context pass", "LocDiT diffusion sampling", "AudioVAE 48kHz decode"];
 
+const API_KEY_STORAGE_KEY = "voxcpm_api_key";
+
 /* ---------- tiny UI atoms ---------- */
 
 function Slider({ label, value, min, max, step, onChange, hint }) {
@@ -252,6 +254,8 @@ export default function VoxCPMKhmerStudio() {
   const [streamMode, setStreamMode] = useState(false);
   const [liveStreaming, setLiveStreaming] = useState(false);
   const [liveLevels, setLiveLevels] = useState([]);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE_KEY) || "");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const audioRef = useRef(null);
   const timers = useRef([]);
   const audioCtxRef = useRef(null);
@@ -263,6 +267,13 @@ export default function VoxCPMKhmerStudio() {
     fetch("/api/model-info").then((r) => (r.ok ? r.json() : null)).then(setModelInfo).catch(() => setModelInfo(null));
   }, []);
 
+  useEffect(() => {
+    if (apiKey) localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+    else localStorage.removeItem(API_KEY_STORAGE_KEY);
+  }, [apiKey]);
+
+  const authHeaders = () => (apiKey ? { Authorization: `Bearer ${apiKey}` } : {});
+
   const uploadRef = (file) => {
     setRefUploadError(null);
     setRefUploading(true);
@@ -271,11 +282,16 @@ export default function VoxCPMKhmerStudio() {
     form.append("file", file);
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/upload-ref");
+    if (apiKey) xhr.setRequestHeader("Authorization", `Bearer ${apiKey}`);
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) setRefUploadProgress(Math.round((e.loaded / e.total) * 100));
     };
     xhr.onload = () => {
       setRefUploading(false);
+      if (xhr.status === 401) {
+        setRefUploadError("Invalid or missing API key — add one in settings.");
+        return;
+      }
       let body = null;
       try { body = JSON.parse(xhr.responseText); } catch { /* ignore */ }
       if (xhr.status >= 200 && xhr.status < 300 && body) {
@@ -331,6 +347,7 @@ export default function VoxCPMKhmerStudio() {
   };
 
   const errorDetail = async (res, fallback) => {
+    if (res.status === 401) return "Invalid or missing API key — add one in settings.";
     try { return (await res.json()).detail || fallback; } catch { return fallback; }
   };
 
@@ -345,7 +362,7 @@ export default function VoxCPMKhmerStudio() {
       if (!useQueue) {
         const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify(buildRequestBody()),
         });
         if (!res.ok) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
@@ -357,14 +374,14 @@ export default function VoxCPMKhmerStudio() {
 
       const submitRes = await fetch(`${url}?async=1`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(buildRequestBody()),
       });
       if (!submitRes.ok) throw new Error(await errorDetail(submitRes, `Server replied ${submitRes.status}`));
       const { job_id } = await submitRes.json();
 
       for (;;) {
-        const statusRes = await fetch(`/api/jobs/${job_id}`);
+        const statusRes = await fetch(`/api/jobs/${job_id}`, { headers: authHeaders() });
         if (!statusRes.ok) throw new Error(await errorDetail(statusRes, `Job status check failed (${statusRes.status})`));
         const s = await statusRes.json();
         if (s.status === "queued") {
@@ -372,7 +389,7 @@ export default function VoxCPMKhmerStudio() {
         } else if (s.status === "running") {
           setGenState({ status: "running", step: 1, error: null, position: null });
         } else if (s.status === "done") {
-          const resultRes = await fetch(`/api/jobs/${job_id}/result`);
+          const resultRes = await fetch(`/api/jobs/${job_id}/result`, { headers: authHeaders() });
           if (!resultRes.ok) throw new Error(await errorDetail(resultRes, `Couldn't fetch the result (${resultRes.status})`));
           const blob = await resultRes.blob();
           setAudioUrl(URL.createObjectURL(blob));
@@ -411,7 +428,7 @@ export default function VoxCPMKhmerStudio() {
     try {
       const res = await fetch(streamUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify(buildRequestBody()),
       });
       if (!res.ok || !res.body) throw new Error(await errorDetail(res, `Server replied ${res.status}`));
@@ -505,6 +522,24 @@ export default function VoxCPMKhmerStudio() {
           <span className="badge">30 languages</span>
           <span className="badge gold">48 kHz out</span>
           <span className="badge">Apache-2.0</span>
+          <div className="settings-wrap">
+            <button className={"gear" + (apiKey ? " has-key" : "")} onClick={() => setSettingsOpen((v) => !v)}
+              aria-label="Settings" title="Settings">⚙</button>
+            {settingsOpen && (
+              <div className="settings-panel">
+                <label className="field-label" htmlFor="apikey">
+                  API key {modelInfo?.auth_required && <span className="opt">required</span>}
+                </label>
+                <input id="apikey" className="field mono" type="password" placeholder="sk-…" value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)} autoComplete="off" />
+                <p className="hint">
+                  Sent as <span className="mono">Authorization: Bearer …</span> on every request.
+                  Stored in this browser (localStorage) only — not synced anywhere.
+                  {!modelInfo?.auth_required && " This server doesn't currently require one."}
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -772,6 +807,11 @@ h1 { font-family: 'Space Grotesk', sans-serif; font-size: clamp(22px, 3.4vw, 30p
 .badges { display: flex; gap: 8px; flex-wrap: wrap; }
 .badge { padding: 5px 11px; border: 1px solid ${T.line}; border-radius: 99px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: ${T.muted}; background: ${T.surface}; }
 .badge.gold { color: ${T.gold}; border-color: rgba(227,168,59,0.4); }
+.settings-wrap { position: relative; }
+.gear { width: 30px; height: 30px; display: grid; place-items: center; appearance: none; cursor: pointer; font-size: 15px; color: ${T.muted}; background: ${T.surface}; border: 1px solid ${T.line}; border-radius: 99px; }
+.gear:hover { color: ${T.text}; border-color: ${T.mutedDeep}; }
+.gear.has-key { color: ${T.jade}; border-color: rgba(87,185,154,0.4); }
+.settings-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 10; width: 280px; padding: 14px; background: ${T.surface}; border: 1px solid ${T.line}; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.35); }
 
 .wave { width: 100%; height: 56px; display: block; margin-bottom: 20px; }
 
