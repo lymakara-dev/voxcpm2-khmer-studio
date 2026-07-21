@@ -39,7 +39,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from . import auth, config, errors, jobs, uploads
-from .tts_model import get_model, is_loaded, stream_pcm16
+from .tts_model import get_model, is_loaded, safe_normalize_flag, stream_pcm16
 
 logger = logging.getLogger("voxcpm-server")
 logging.basicConfig(level=logging.INFO)
@@ -138,7 +138,7 @@ def _generate_kwargs(req: TTSRequest) -> dict:
         text=req.text,
         cfg_value=req.cfg_value,
         inference_timesteps=req.inference_timesteps,
-        normalize=req.normalize,
+        normalize=safe_normalize_flag(req.text, req.normalize),
         denoise=req.denoise,
         retry_badcase=req.retry_badcase,
         reference_wav_path=req.reference_wav_path,

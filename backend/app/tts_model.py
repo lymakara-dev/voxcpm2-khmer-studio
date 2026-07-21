@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 import numpy as np
@@ -13,6 +14,29 @@ from . import config
 logger = logging.getLogger("voxcpm-server")
 
 MOCK_SAMPLE_RATE = 48000
+
+# Khmer script + Khmer Symbols Unicode blocks (covers Khmer digits ០-៩, U+17E0-17E9).
+_KHMER_RE = re.compile(r"[ក-៿᧠-᧿]")
+
+
+def contains_khmer(text: str) -> bool:
+    return bool(_KHMER_RE.search(text))
+
+
+def safe_normalize_flag(text: str, requested: bool) -> bool:
+    """voxcpm's bundled TextNormalizer only knows two languages: it treats
+    anything without Chinese characters as English. Khmer text falls into
+    that "en" branch, where digit runs — Python's `str.isdigit()` is True
+    for Khmer digits too — get spelled out with an English number-to-words
+    library and spliced into the sentence (e.g. "អាយុ២៥ឆ្នាំ" becomes
+    "អាយុtwenty-fiveឆ្នាំ"), garbling pronunciation.
+
+    The model's tokenizer round-trips raw Khmer digits fine on its own, so
+    for Khmer text we force normalization off rather than let it run
+    through the broken zh/en path."""
+    if requested and contains_khmer(text):
+        return False
+    return requested
 
 
 class _MockTTSInner:
